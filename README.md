@@ -48,7 +48,7 @@ sudo ./target/release/synapse [OPTIONS] --target <TARGET>
 | `--scan-type` | `-s` | `connect` | `connect` or `syn` |
 | `--threads` | | `1000` | Max concurrent tasks (connect scan) |
 | `--timeout` | | `500` | Timeout per port in milliseconds |
-| `--output` | `true` | Output results to a results dir |
+| `--output` | `t` | `true` | Output results to a results dir |
 
 ### Examples
 
