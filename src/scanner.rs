@@ -127,7 +127,6 @@ fn get_local_ips() -> (Option<std::net::Ipv4Addr>, Option<std::net::Ipv6Addr>) {
     let mut v6 = None;
 
     for iface in datalink::interfaces() {
-        // Skip loopback and down interfaces
         if iface.is_loopback() || !iface.is_up() {
             continue;
         }

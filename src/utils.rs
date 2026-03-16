@@ -57,7 +57,6 @@ pub fn parse_ports(port_str: &str) -> Result<Vec<u16>, String> {
 fn parse_target_addr(ip_raw: &str) -> Result<Vec<IpNetwork>, String> {
     let (host_str, prefix_opt) = match ip_raw.split_once('/') {
         Some((host, prefix_str)) => {
-            // Parse the string after the '/' into an 8-bit integer
             let prefix: u8 = prefix_str.parse()
                 .map_err(|_| format!("Invalid CIDR number: {}", prefix_str))?;
             (host, Some(prefix))
