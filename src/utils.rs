@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, ToSocketAddrs, UdpSocket};
 use std::fs;
+use std::time::SystemTime;
 use ipnetwork::IpNetwork;
 
 pub fn load_services(path: &str) -> HashMap<u16, String> {
@@ -187,6 +188,21 @@ pub fn sensitive_dns_exclusions() -> Vec<IpNetwork> {
         .filter_map(|s| s.parse::<IpAddr>().ok())
         .filter_map(|ip| IpNetwork::new(ip, if ip.is_ipv4() { 32 } else { 128 }).ok())
         .collect()
+}
+
+pub fn save_results(target: &str, content: &str) -> Result<String, std::io::Error> {
+    fs::create_dir_all("results")?;
+    let sanitized = target
+        .chars()
+        .map(|c| if c.is_alphanumeric() || c == '.' || c == '-' { c } else { '_' })
+        .collect::<String>();
+    let ts = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let path = format!("results/synapse_{}_{}.txt", sanitized, ts);
+    fs::write(&path, content)?;
+    Ok(path)
 }
 
 pub fn master_target_parser(input: &str) -> Result<Vec<IpAddr>, String> {
