@@ -1,75 +1,29 @@
+use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, ToSocketAddrs, UdpSocket};
-
+use std::fs;
 use ipnetwork::IpNetwork;
 
-use pnet::transport::{
-    transport_channel, TransportChannelType,
-    TransportSender, TransportReceiver,
-    TransportProtocol,
-};
-use pnet::packet::ip::IpNextHeaderProtocols;
+pub fn load_services(path: &str) -> HashMap<u16, String> {
+    let mut services = HashMap::new();
+    let contents = fs::read_to_string(path).unwrap_or_default();
+    for line in contents.lines() {
+        if line.starts_with('#') || line.is_empty() {
+            continue;
+        }
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() >= 2 {
+            let name = parts[0];
+            if let Some((port_str, proto)) = parts[1].split_once('/') {
+                if proto == "tcp" {
+                    if let Ok(port) = port_str.parse::<u16>() {
+                        services.insert(port, name.to_string());
+                    }
+                }
+            }
+        }
+    }
 
-pub struct Channels {
-    pub v4: Option<(TransportSender, TransportReceiver)>,
-    pub v6: Option<(TransportSender, TransportReceiver)>,
-}
-
-pub fn open_tcp(ips: &[IpAddr]) -> Channels {
-    let has_v4 = ips.iter().any(|ip| ip.is_ipv4());
-    let has_v6 = ips.iter().any(|ip| ip.is_ipv6());
-
-    let v4 = if has_v4 {
-        Some(transport_channel(
-            1024,
-            TransportChannelType::Layer4(
-                TransportProtocol::Ipv4(IpNextHeaderProtocols::Tcp)
-            )
-        ).unwrap())
-    } else {
-        None
-    };
-
-    let v6 = if has_v6 {
-        Some(transport_channel(
-            1024,
-            TransportChannelType::Layer4(
-                TransportProtocol::Ipv6(IpNextHeaderProtocols::Tcp)
-            )
-        ).unwrap())
-    } else {
-        None
-    };
-
-    Channels { v4, v6 }
-}
-
-pub fn open_icmp(ips: &[IpAddr]) -> Channels {
-    let has_v4 = ips.iter().any(|ip| ip.is_ipv4());
-    let has_v6 = ips.iter().any(|ip| ip.is_ipv6());
-
-    let v4 = if has_v4 {
-        Some(transport_channel(
-            1024,
-            TransportChannelType::Layer4(
-                TransportProtocol::Ipv4(IpNextHeaderProtocols::Icmp)
-            )
-        ).unwrap())
-    } else {
-        None
-    };
-
-    let v6 = if has_v6 {
-        Some(transport_channel(
-            1024,
-            TransportChannelType::Layer4(
-                TransportProtocol::Ipv6(IpNextHeaderProtocols::Icmpv6)
-            )
-        ).unwrap())
-    } else {
-        None
-    };
-
-    Channels { v4, v6 }
+    services
 }
 
 pub fn parse_ports(port_str: &str) -> Result<Vec<u16>, String> {
@@ -210,13 +164,31 @@ fn parse_octet_range(target: &str) -> Result<Vec<IpAddr>, String> {
     Ok(generated_ips)
 }
 
-// fn apply_exclusions(targets: Vec<IpAddr>, exclusions: &[IpNetwork]) -> Vec<IpAddr> {
-//     targets.into_iter()
-//         .filter(|ip| {
-//             !exclusions.iter().any(|excluded_net| excluded_net.contains(*ip))
-//         })
-//         .collect()
-// }
+pub fn apply_exclusions(targets: Vec<IpAddr>, exclusions: &[IpNetwork]) -> Vec<IpAddr> {
+    targets.into_iter()
+        .filter(|ip| !exclusions.iter().any(|excluded_net| excluded_net.contains(*ip)))
+        .collect()
+}
+
+/// Hardcoded list of sensitive public DNS infrastructure that should never be scanned.
+pub fn sensitive_dns_exclusions() -> Vec<IpNetwork> {
+    let addrs: &[&str] = &[
+        "1.1.1.1",           // Cloudflare primary
+        "1.0.0.1",           // Cloudflare secondary
+        "8.8.8.8",           // Google primary
+        "8.8.4.4",           // Google secondary
+        "9.9.9.9",           // Quad9 primary
+        "149.112.112.112",   // Quad9 secondary
+        "208.67.222.222",    // OpenDNS primary
+        "208.67.220.220",    // OpenDNS secondary
+        "64.6.64.6",         // Verisign primary
+        "64.6.65.6",         // Verisign secondary
+    ];
+    addrs.iter()
+        .filter_map(|s| s.parse::<IpAddr>().ok())
+        .filter_map(|ip| IpNetwork::new(ip, if ip.is_ipv4() { 32 } else { 128 }).ok())
+        .collect()
+}
 
 pub fn master_target_parser(input: &str) -> Result<Vec<IpAddr>, String> {
     let mut final_ips = Vec::new();

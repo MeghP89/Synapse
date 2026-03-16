@@ -1,124 +1,115 @@
-use pnet::packet::ethernet::{EtherTypes, MutableEthernetPacket, EthernetPacket};
-use pnet::packet::ipv4::{self, MutableIpv4Packet, Ipv4Packet};
-use pnet::packet::tcp::{self, MutableTcpPacket, TcpFlags, TcpPacket};
-use pnet::packet::ip::IpNextHeaderProtocols;
+use pnet::packet::tcp::{MutableTcpPacket, ipv4_checksum, ipv6_checksum};
+use pnet::packet::icmp::{IcmpPacket, IcmpTypes, checksum};
+use pnet::packet::icmp::echo_request::MutableEchoRequestPacket;
 use pnet::packet::Packet;
-use pnet::util::MacAddr;
-use std::net::Ipv4Addr;
+use pnet::transport::{
+    transport_channel, TransportChannelType,
+    TransportSender, TransportReceiver,
+    TransportProtocol,
+};
+use pnet::packet::ip::IpNextHeaderProtocols;
+use std::net::IpAddr;
 
-pub struct ScanConfig {
-    pub src_mac: MacAddr,
-    pub dst_mac: MacAddr,
-    pub src_ip: Ipv4Addr,
-    pub src_port: u16,
+pub struct Channels {
+    pub v4: Option<(TransportSender, TransportReceiver)>,
+    pub v6: Option<(TransportSender, TransportReceiver)>,
 }
 
-pub struct PortResponse {
-    pub port: u16,
-    pub is_open: bool,
-}
+pub fn open_tcp(ips: &[IpAddr]) -> Channels {
+    let has_v4 = ips.iter().any(|ip| ip.is_ipv4());
+    let has_v6 = ips.iter().any(|ip| ip.is_ipv6());
 
-fn build_packet(
-    config: &ScanConfig,
-    dst_ip: Ipv4Addr,
-    dst_port: u16,
-    flags: u8, 
-    seq_num: u32,
-) -> Vec<u8> {
-    let mut packet_buf = vec![0u8; 54];
-    {
-        let tcp_offset = 34;
-        let mut tcp = MutableTcpPacket::new(&mut packet_buf[tcp_offset..]).unwrap();
-        tcp.set_source(config.src_port);
-        tcp.set_destination(dst_port);
-        tcp.set_sequence(seq_num);
-        tcp.set_acknowledgement(0);
-        tcp.set_data_offset(5);
-        tcp.set_flags(flags);
-        tcp.set_window(1024);
-        let checksum = tcp::ipv4_checksum(&tcp.to_immutable(), &config.src_ip, &dst_ip);
-        tcp.set_checksum(checksum);
-        println!("[*] TCP flags=SYN src_port={} dst_port={dst_port} seq={seq_num}", config.src_port);
-    }
-
-    {
-        let ip_offset = 14;
-        let mut ip = MutableIpv4Packet::new(&mut packet_buf[ip_offset..]).unwrap();
-
-        ip.set_version(4);
-        ip.set_header_length(5);
-        ip.set_total_length((40) as u16);
-        ip.set_ttl(64);
-        ip.set_next_level_protocol(IpNextHeaderProtocols::Tcp);
-        ip.set_source(config.src_ip);
-        ip.set_destination(dst_ip);
-        ip.set_flags(ipv4::Ipv4Flags::DontFragment);
-        let checksum = ipv4::checksum(&ip.to_immutable());
-        ip.set_checksum(checksum);
-
-        println!("[*] IPv4 src={} dst={} ttl=64 proto=TCP", config.src_ip, dst_ip);
-    }
-
-    {
-        let mut eth = MutableEthernetPacket::new(&mut packet_buf[..]).unwrap();
-        eth.set_source(config.src_mac);
-        eth.set_destination(config.dst_mac);
-        eth.set_ethertype(EtherTypes::Ipv4);
-        
-        println!("[*] Eth  src={} dst={} type=IPv4", config.src_mac, config.dst_mac);
-    }
-    packet_buf
-}
-
-pub fn build_syn(
-    config: &ScanConfig,
-    dst_ip: Ipv4Addr,
-    dst_port: u16,
-    seq_num: u32,
-) -> Vec<u8> {
-    build_packet(config, dst_ip, dst_port, TcpFlags::SYN, seq_num)
-}
-
-pub fn build_rst(
-    config: &ScanConfig,
-    dst_ip: Ipv4Addr,
-    dst_port: u16,
-    seq_num: u32,
-) -> Vec<u8> {
-    build_packet(config, dst_ip, dst_port, TcpFlags::RST, seq_num)
-}
-
-pub fn parse_response(frame: &[u8], our_ip: Ipv4Addr) -> Option<PortResponse> {
-    let eth = EthernetPacket::new(frame)?;
-
-    if eth.get_ethertype() != EtherTypes::Ipv4 {
-        return None;
-    }
-
-    let ip = Ipv4Packet::new(eth.payload())?;
-    if ip.get_destination() != our_ip {
-        return None;
-    }
-
-    if ip.get_next_level_protocol() != IpNextHeaderProtocols::Tcp {
-        return None;
-    }
-
-    let tcp = TcpPacket::new(ip.payload())?;
-    println!("[dbg] TCP dst={} our={} flags={}", tcp.get_destination(), our_ip, tcp.get_flags());
-
-
-    // if tcp.get_destination() != our_port {
-    //     return None;
-    // }
-
-    let flags = tcp.get_flags();
-
-    if flags & TcpFlags::SYN != 0 && flags & TcpFlags::ACK != 0 {
-        Some(PortResponse { port: tcp.get_source(), is_open: true})
-    } else if flags & TcpFlags::RST != 0 {
-        Some(PortResponse { port: tcp.get_source(), is_open: false })
+    let v4 = if has_v4 {
+        Some(transport_channel(
+            1024,
+            TransportChannelType::Layer4(
+                TransportProtocol::Ipv4(IpNextHeaderProtocols::Tcp)
+            )
+        ).unwrap())
     } else {
         None
+    };
+
+    let v6 = if has_v6 {
+        Some(transport_channel(
+            1024,
+            TransportChannelType::Layer4(
+                TransportProtocol::Ipv6(IpNextHeaderProtocols::Tcp)
+            )
+        ).unwrap())
+    } else {
+        None
+    };
+
+    Channels { v4, v6 }
+}
+
+pub fn open_icmp(ips: &[IpAddr]) -> Channels {
+    let has_v4 = ips.iter().any(|ip| ip.is_ipv4());
+    let has_v6 = ips.iter().any(|ip| ip.is_ipv6());
+
+    let v4 = if has_v4 {
+        Some(transport_channel(
+            1024,
+            TransportChannelType::Layer4(
+                TransportProtocol::Ipv4(IpNextHeaderProtocols::Icmp)
+            )
+        ).unwrap())
+    } else {
+        None
+    };
+
+    let v6 = if has_v6 {
+        Some(transport_channel(
+            1024,
+            TransportChannelType::Layer4(
+                TransportProtocol::Ipv6(IpNextHeaderProtocols::Icmpv6)
+            )
+        ).unwrap())
+    } else {
+        None
+    };
+
+    Channels { v4, v6 }
+}
+
+pub fn build_tcp_packet(
+    src_ip: IpAddr,
+    dst_ip: IpAddr,
+    src_port: u16,
+    dst_port: u16,
+    flags: u8,
+) -> Vec<u8> {
+    let mut tcp_buf = vec![0u8; 20];
+    let mut tcp_packet = MutableTcpPacket::new(&mut tcp_buf).unwrap();
+
+    tcp_packet.set_source(src_port);
+    tcp_packet.set_destination(dst_port);
+    tcp_packet.set_sequence(rand::random::<u32>());
+    tcp_packet.set_acknowledgement(0);
+    tcp_packet.set_data_offset(5);
+    tcp_packet.set_flags(flags);
+    tcp_packet.set_window(65535);
+    let cksum = match (src_ip, dst_ip) {
+        (IpAddr::V4(src), IpAddr::V4(dst)) => ipv4_checksum(&tcp_packet.to_immutable(), &src, &dst),
+        (IpAddr::V6(src), IpAddr::V6(dst)) => ipv6_checksum(&tcp_packet.to_immutable(), &src, &dst),
+        _ => panic!("src and dst must be same IP version"),
+    };
+    tcp_packet.set_checksum(cksum);
+    tcp_buf
+}
+
+pub fn build_icmp_echo_request() -> Vec<u8> {
+    let mut buf = vec![0u8; 64];
+    {
+        let mut packet = MutableEchoRequestPacket::new(&mut buf).unwrap();
+        packet.set_icmp_type(IcmpTypes::EchoRequest);
+        packet.set_identifier(1234);
+        packet.set_sequence_number(1);
+        packet.set_payload(&[0u8; 56]);
+        let icmp_packet = IcmpPacket::new(packet.packet()).unwrap();
+        let cksum = checksum(&icmp_packet);
+        packet.set_checksum(cksum);
     }
+    buf
 }

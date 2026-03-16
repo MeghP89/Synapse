@@ -1,12 +1,16 @@
-use crate::utils::{Channels};
+use crate::packet::{Channels};
 use std::net::{IpAddr};
 use std::collections::HashMap;
-use std::time::{Duration, Instant};
+use std::net::SocketAddr;
+use std::sync::Arc;
+use std::time::{Instant};
 
 use pnet::packet::tcp::TcpFlags;
 use pnet::transport::tcp_packet_iter;
-use pnet::{datalink, packet::tcp::{MutableTcpPacket, ipv4_checksum, ipv6_checksum}};
-
+use pnet::{datalink, packet::tcp::MutableTcpPacket};
+use tokio::sync::Semaphore;
+use tokio::time::{timeout, Duration};
+use tokio::net::TcpStream;
 #[derive(Debug, Clone, PartialEq)]
 pub enum PortStatus {
     Open,
@@ -14,20 +18,18 @@ pub enum PortStatus {
     Filtered,
 }
 
-// pub struct ScanResult {
-//     pub ip: IpAddr,
-//     pub hostname: String,
-//     pub ports: HashMap<u16, PortStatus>,
-// }
+pub struct ScanResult {
+    pub ip: IpAddr,
+    pub hostname: String,
+    pub ports: HashMap<u16, PortStatus>,
+}
 
-pub fn scan_ports(
+pub fn stealth_scan(
     dst_ip: IpAddr,
     dst_ports: &[u16],
     channels: &mut Channels
 ) -> HashMap<u16, PortStatus> {
     let (local_v4, local_v6) = get_local_ips();
-    println!("Local IPs: v4={:?} v6={:?}", local_v4, local_v6);
-
     let src_ip = match dst_ip {
         IpAddr::V4(_) => {
             IpAddr::V4(local_v4.expect("no local v4"))
@@ -43,7 +45,7 @@ pub fn scan_ports(
     let mut port_map: HashMap<u16, PortStatus> = HashMap::new();
     for port in dst_ports {
         let src_port = rand::random_range(49152..65535);
-        let packet = build_packet(src_ip, dst_ip, src_port, *port, TcpFlags::SYN);
+        let packet = crate::packet::build_tcp_packet(src_ip, dst_ip, src_port, *port, TcpFlags::SYN);
         let tcp_packet = MutableTcpPacket::owned(packet).unwrap();
         let _ = tx.send_to(tcp_packet, dst_ip);
         port_map.insert(*port, PortStatus::Filtered);
@@ -66,7 +68,7 @@ pub fn scan_ports(
                 if port_map.contains_key(&src_port) {
                     if flags & TcpFlags::SYN != 0 && flags & TcpFlags::ACK != 0 {
                         port_map.insert(src_port, PortStatus::Open);
-                        let packet = build_packet(src_ip, dst_ip, rand::random_range(49152..65535), src_port, TcpFlags::RST);
+                        let packet = crate::packet::build_tcp_packet(src_ip, dst_ip, rand::random_range(49152..65535), src_port, TcpFlags::RST);
                         let tcp_packet = MutableTcpPacket::owned(packet).unwrap();
                         let _ = tx.send_to(tcp_packet, dst_ip);
                     } else if flags & TcpFlags::RST != 0 {
@@ -80,6 +82,45 @@ pub fn scan_ports(
     }
     port_map
 } 
+
+pub async fn connect_scan(
+    dst_ip: IpAddr,
+    dst_ports: &[u16],
+    timeout_ms: u64,
+    max_threads: usize, 
+) -> HashMap<u16, PortStatus> {
+    let semaphore = Arc::new(Semaphore::new(max_threads));
+    let mut handles = Vec::new();
+    for &port in dst_ports {
+        let sem = semaphore.clone();
+        let handle = tokio::spawn(async move {
+            let _permit = sem.acquire().await.unwrap();
+            let addr = SocketAddr::new(dst_ip, port);
+            let status = match timeout(
+                Duration::from_millis(timeout_ms),
+                TcpStream::connect(addr),
+            ).await {
+                Ok(Ok(_)) => PortStatus::Open,
+                Ok(Err(e)) => {
+                    if e.kind() == std::io::ErrorKind::ConnectionRefused {
+                        PortStatus::Closed
+                    } else {
+                        PortStatus::Filtered
+                    }
+                }
+                Err(_) => PortStatus::Filtered,
+            };
+            (port, status)
+        });
+        handles.push(handle);
+    }
+    let mut results = HashMap::new();
+    for handle in handles {
+        let (port, status) = handle.await.unwrap();
+        results.insert(port, status);
+    }
+    results
+}
 
 fn get_local_ips() -> (Option<std::net::Ipv4Addr>, Option<std::net::Ipv6Addr>) {
     let mut v4 = None;
@@ -106,34 +147,3 @@ fn get_local_ips() -> (Option<std::net::Ipv4Addr>, Option<std::net::Ipv6Addr>) {
     (v4, v6)
 }
 
-fn build_packet(
-    src_ip: IpAddr,
-    dst_ip: IpAddr,
-    src_port: u16,
-    dst_port: u16,
-    flags: u8,
-) -> Vec<u8> {
-    let tcp_len = 20;
-    let mut tcp_buf = vec![0u8; tcp_len];
-    let mut tcp_packet = MutableTcpPacket::new(&mut tcp_buf).unwrap();
-
-    tcp_packet.set_source(src_port);
-    tcp_packet.set_destination(dst_port);
-    tcp_packet.set_sequence(rand::random::<u32>());
-    tcp_packet.set_acknowledgement(0);
-    tcp_packet.set_data_offset(5);
-    tcp_packet.set_flags(flags);
-    tcp_packet.set_window(65535);
-    let cksum = match (src_ip, dst_ip) {
-        (IpAddr::V4(src), IpAddr::V4(dst)) => {
-            ipv4_checksum(&tcp_packet.to_immutable(), &src, &dst)
-        }
-        (IpAddr::V6(src), IpAddr::V6(dst)) => {
-            ipv6_checksum(&tcp_packet.to_immutable(), &src, &dst)
-        }
-        _ => panic!("src and dst must be same IP version"),
-    };
-    tcp_packet.set_checksum(cksum);
-
-    tcp_buf
-}

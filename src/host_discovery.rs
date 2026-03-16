@@ -1,10 +1,9 @@
-use pnet::packet::Packet;
-use pnet::packet::icmp::{IcmpPacket, IcmpTypes, checksum};
+use pnet::packet::icmp::{IcmpTypes};
 use pnet::packet::icmp::echo_request::MutableEchoRequestPacket;
 use pnet::transport::{TransportReceiver, TransportSender, icmp_packet_iter};
 use indicatif::ProgressBar;
 
-use crate::utils::Channels;
+use crate::packet::Channels;
 
 use std::net::IpAddr;
 use std::collections::HashMap;
@@ -40,17 +39,7 @@ fn blast_and_collect(
     bar: &ProgressBar,
 ) {
     for &ip in ips {
-        let mut buf = [0u8; 64];
-        let mut packet = MutableEchoRequestPacket::new(&mut buf).unwrap();
-        packet.set_icmp_type(IcmpTypes::EchoRequest);
-        packet.set_identifier(1234);
-        packet.set_sequence_number(1);
-        packet.set_payload(&[0u8; 56]);
-
-        let icmp_packet = IcmpPacket::new(packet.packet()).unwrap();
-        let cksum = checksum(&icmp_packet);
-        packet.set_checksum(cksum);
-
+        let packet = MutableEchoRequestPacket::owned(crate::packet::build_icmp_echo_request()).unwrap();
         let _ = tx.send_to(packet, ip);
         results.insert(ip, false);
     }
