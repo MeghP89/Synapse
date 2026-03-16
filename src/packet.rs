@@ -88,16 +88,29 @@ pub fn build_rst(
     build_packet(config, dst_ip, dst_port, TcpFlags::RST, seq_num)
 }
 
-pub fn parse_response(frame: &[u8], our_port: u16) -> Option<PortResponse> {
+pub fn parse_response(frame: &[u8], our_ip: Ipv4Addr) -> Option<PortResponse> {
     let eth = EthernetPacket::new(frame)?;
 
-    let ip = Ipv4Packet::new(eth.payload())?;
-
-    let tcp = TcpPacket::new(ip.payload())?;
-
-    if tcp.get_destination() != our_port {
+    if eth.get_ethertype() != EtherTypes::Ipv4 {
         return None;
     }
+
+    let ip = Ipv4Packet::new(eth.payload())?;
+    if ip.get_destination() != our_ip {
+        return None;
+    }
+
+    if ip.get_next_level_protocol() != IpNextHeaderProtocols::Tcp {
+        return None;
+    }
+
+    let tcp = TcpPacket::new(ip.payload())?;
+    println!("[dbg] TCP dst={} our={} flags={}", tcp.get_destination(), our_ip, tcp.get_flags());
+
+
+    // if tcp.get_destination() != our_port {
+    //     return None;
+    // }
 
     let flags = tcp.get_flags();
 

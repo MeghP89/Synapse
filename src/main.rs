@@ -1,103 +1,120 @@
-// Personal Packages
-mod packet;
-use packet::{ScanConfig, build_syn, build_rst, parse_response};
+mod host_discovery;
+use std::net::IpAddr;
+
+use host_discovery::discover_live_hosts;
+
+mod utils;
+use utils::{parse_ports, master_target_parser, dns_resolver, open_icmp, open_tcp};
+
+mod scanner;
+use scanner::{scan_ports};
+
+// mod packet;
+// use packet::{ScanConfig, build_syn, build_rst, parse_response};
 
 // External
-use pnet::datalink::{self, NetworkInterface};
-use pnet::datalink::Channel::Ethernet;
-use pnet::util::MacAddr;
-use std::net::Ipv4Addr;
-use std::env;
+use clap::{Parser, ValueEnum};
 
-fn main() {
-    let args: Vec<String> = env::args().collect();
-    if args.len() != 4 {
-        eprintln!("Usage: sudo cargo run -- <interface> <target_ip> <target_port>");
-        eprintln!("       sudo cargo run -- eth0 93.184.216.34 80");
-        std::process::exit(1);
+#[derive(Parser, Debug)]
+#[command(name = "rnmap")]
+#[command(about = "A barebones Rust port scanner MVP", long_about = None)]
+struct Args {
+    /// The target IP address or CIDR block (e.g., 192.168.1.1 or 10.0.0.0/24)
+    #[arg(short = 't', long)]
+    target: String,
+
+    /// Ports to scan (e.g., "80,443" or "1-1024")
+    #[arg(short = 'p', long, default_value = "80,23,443,21,22,25,3389,110,445,139,143,53,135,3306,8080,1723,111,995,993,5900")]
+    ports: String,
+
+    /// Type of scan to perform
+    #[arg(short = 's', long, value_enum, default_value_t = ScanType::Connect)]
+    scan_type: ScanType,
+
+    /// Number of concurrent tasks/threads
+    #[arg(long, default_value_t = 100)]
+    threads: usize,
+
+    /// Timeout in milliseconds per port connection
+    #[arg(long, default_value_t = 500)]
+    timeout: u64,
+}
+
+#[derive(ValueEnum, Clone, Debug)]
+enum ScanType {
+    Connect,
+    Syn,
+}
+
+
+#[tokio::main]
+async fn main() {
+    let args = Args::parse();
+
+    println!("Target: {}", args.target);
+    println!("Ports: {}", args.ports);
+    println!("Scan Type: {:?}", args.scan_type);
+    println!("Threads: {}", args.threads);
+    println!("Timeout: {}ms", args.timeout);
+
+    let ips = master_target_parser(&args.target).unwrap();
+    if ips.len() > 1024 {
+        eprintln!("Warning: {} IPs is a lot, are you sure? (use --force to proceed)", ips.len());
+        return;
     }
+    let target_ports = parse_ports(&args.ports).unwrap();
 
-    let iface_name  = &args[1];
-    let target_ip:   Ipv4Addr = args[2].parse().expect("Invalid target IP");
-    let target_port: u16      = args[3].parse().expect("Invalid port number");
+    let results = dns_resolver(&ips).await;
 
-    // ── 1. find the network interface ───────────────────────────────────────
-    //
-    // pnet works at the interface level — you pick which NIC to send from.
-    // Each interface has a MAC address (layer 2) and an IP address (layer 3).
-    let interfaces = datalink::interfaces();
-    let interface: NetworkInterface = interfaces
-        .into_iter()
-        .find(|iface| iface.name == *iface_name)
-        .expect(&format!("Interface '{}' not found", iface_name));
+    // ICMP Host Discovery
+    let mut icmp_channels = open_icmp(&ips);
+    let hosts = discover_live_hosts(&ips, &mut icmp_channels);
 
-    // grab our source IP from the interface
-    let source_ip = interface
-        .ips
-        .iter()
-        .find_map(|ip| if let std::net::IpAddr::V4(v4) = ip.ip() { Some(v4) } else { None })
-        .expect("No IPv4 address on interface");
+    // Collect live hosts
+    let live_ips: Vec<IpAddr> = ips.iter()
+        .filter(|ip| hosts.get(ip).copied().unwrap_or(false))
+        .copied()
+        .collect();
 
-    println!("[*] Interface : {}", interface.name);
-    println!("[*] Source IP  : {}", source_ip);
-    println!("[*] Target     : {}:{}", target_ip, target_port);
-
-    let my_config = ScanConfig {
-        src_mac: interface.mac.unwrap(),
-        dst_mac: MacAddr::broadcast(),
-        src_ip: source_ip,
-        src_port: 49152,
-    };
-
-    
-
-    // ── 2. open a raw datalink channel ──────────────────────────────────────
-    //
-    // A datalink channel lets us send raw Ethernet frames — no OS TCP stack
-    // involved. We're operating below the kernel's networking layer.
-    let (mut tx, mut rx) = match datalink::channel(&interface, Default::default()) {
-        Ok(Ethernet(tx, rx)) => (tx, rx),
-        Ok(_)  => panic!("Unexpected channel type"),
-        Err(e) => panic!("Failed to open channel: {}", e),
-    };
-
-
-    let packet_buf = build_syn(&my_config, target_ip, target_port, 12345);
-    match tx.send_to(&packet_buf, None) {
-        Some(Ok(_))  => println!("[✓] Packet sent ({} bytes)", packet_buf.len()),
-        Some(Err(e)) => eprintln!("[✗] Send error: {}", e),
-        None         => eprintln!("[✗] Send returned None"),
-    }
-
-    println!("\n--- packet memory layout ---");
-    println!("bytes  0-13  : Ethernet header");
-    println!("bytes 14-33  : IPv4 header");
-    println!("bytes 34-53  : TCP header (SYN flag set at byte 47)");
-    println!("total        : {} bytes", packet_buf.len());
-
-    loop {
-        match rx.next() {
-            Ok(frame) => {
-                if let Some(response) = parse_response(frame, my_config.src_port) {
-                    if response.is_open {
-                        println!("Port {} is OPEN!", response.port);
-                    } else {
-                        println!("Port {} is CLOSED!", response.port);
-                    }
-                    break; 
-                }
-            }
-            Err(e) => {
-                eprintln!("rx error: {}", e);
-                break;
-            }
+    for (ip, hostname) in ips.iter().zip(results.iter()) {
+        let is_up = hosts.get(ip).copied().unwrap_or(false);
+        if is_up {
+            println!("{} ({}) appears to be up", hostname, ip);
+        } else {
+            println!("{} ({}) appears to be down", hostname, ip);
         }
     }
 
-    let rst_packet = build_rst(&my_config, target_ip, target_port, 12346); // seq_num + 1
-    match tx.send_to(&rst_packet, None) {
-        Some(Ok(_))  => println!("[✓] RST sent to {}:{}", target_ip, target_port),
-        Some(Err(e)) => eprintln!("[✗] Send error: {}", e),
-        None         => eprintln!("[✗] Nothing sent"),
+    if live_ips.is_empty() {
+        println!("No live hosts found. Exiting.");
+        return;
+    }
+
+    // Port Scanning
+    let mut tcp_channels = open_tcp(&live_ips);
+
+    for (_i, &ip) in live_ips.iter().enumerate() {
+        let hostname = ips.iter()
+            .position(|&x| x == ip)
+            .map(|idx| results[idx].clone())
+            .unwrap_or(ip.to_string());
+
+        println!("\nScan report for {} ({})", hostname, ip);
+        println!("{:<10} {}", "PORT", "STATE");
+
+        let port_results = scan_ports(ip, &target_ports, &mut tcp_channels);
+
+        let mut open_ports: Vec<_> = port_results.iter()
+            .filter(|(_, status)| **status == scanner::PortStatus::Open)
+            .collect();
+        open_ports.sort_by_key(|(port, _)| *port);
+
+        for (port, status) in &open_ports {
+            println!("{}/tcp     {:?}", port, status);
+        }
+
+        if open_ports.is_empty() {
+            println!("All {} ports are closed or filtered", target_ports.len());
+        }
     }
 }

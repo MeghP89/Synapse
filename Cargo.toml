@@ -4,4 +4,9 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+clap = { version = "4.5", features = ["derive"] }
+tokio = { version = "1.36", features = ["full"] }
+ipnetwork = "0.20"
 pnet = "0.34.0"
+rand = "0.10.0"
+indicatif = "0.17"
