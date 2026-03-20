@@ -43,6 +43,10 @@ struct Args {
     /// Save results to a file in the results/ folder
     #[arg(short = 'o', long, default_value_t = false)]
     output: bool,
+
+    /// Print a performance/complexity analysis after the scan
+    #[arg(long, default_value_t = false)]
+    bench: bool,
 }
 
 #[derive(ValueEnum, Clone, Debug)]
@@ -58,7 +62,6 @@ async fn main() {
     let args = Args::parse();
     let services = load_services("data/nmap-services");
 
-    // emit! prints a line and, if --output is set, appends it to the report buffer.
     let mut report = String::new();
     macro_rules! emit {
         ($($arg:tt)*) => {{
@@ -131,6 +134,8 @@ async fn main() {
         ScanType::Connect => None,
     };
 
+    let mut host_scan_times: Vec<(IpAddr, std::time::Duration)> = Vec::new();
+
     for &ip in live_ips.iter() {
         let hostname = ips.iter()
             .position(|&x| x == ip)
@@ -144,6 +149,7 @@ async fn main() {
         };
         let scan_elapsed = scan_start.elapsed();
 
+        host_scan_times.push((ip, scan_elapsed));
         let scan_result = ScanResult { ip, hostname, ports };
 
         let n_open     = scan_result.ports.values().filter(|s| **s == PortStatus::Open).count();
@@ -175,7 +181,113 @@ async fn main() {
     emit!("\n{}", "─".repeat(60));
     emit!("Scan complete in {:.2}s", total_start.elapsed().as_secs_f64());
 
+    if args.bench {
+        emit_bench(
+            &mut report,
+            &args.scan_type,
+            ips.len(),
+            live_ips.len(),
+            target_ports.len(),
+            args.threads,
+            args.timeout,
+            &host_scan_times,
+        );
+    }
+
     maybe_save(&args.target, &report, args.output);
+}
+
+fn emit_bench(
+    report: &mut String,
+    scan_type: &ScanType,
+    total_hosts: usize,
+    live_hosts: usize,
+    ports: usize,
+    threads: usize,
+    timeout_ms: u64,
+    host_times: &[(IpAddr, std::time::Duration)],
+) {
+    macro_rules! out {
+        ($($arg:tt)*) => {{
+            let line = format!($($arg)*);
+            println!("{}", line);
+            report.push_str(&line);
+            report.push('\n');
+        }};
+    }
+
+    let probe_space = live_hosts * ports;
+    let timeout_s = timeout_ms as f64 / 1000.0;
+
+    // Theoretical bounds for connect scan.
+    // Serial: every probe waits up to timeout — O(H × P × timeout)
+    let theoretical_serial_s = live_hosts as f64 * ports as f64 * timeout_s;
+    // Parallel: ports are batched across threads — O(H × ceil(P/T) × timeout)
+    let batches = (ports + threads - 1) / threads; // ceil(P/T)
+    let theoretical_parallel_s = live_hosts as f64 * batches as f64 * timeout_s;
+
+    let actual_scan_s: f64 = host_times.iter().map(|(_, d)| d.as_secs_f64()).sum();
+    let throughput = if actual_scan_s > 0.0 { probe_space as f64 / actual_scan_s } else { f64::INFINITY };
+
+    // Efficiency: how close actual is to the theoretical parallel lower bound (capped at 100%)
+    let efficiency = if actual_scan_s > 0.0 {
+        (theoretical_parallel_s / actual_scan_s * 100.0).min(100.0)
+    } else {
+        100.0
+    };
+
+    let saturated = threads >= ports;
+    let complexity_note = match scan_type {
+        ScanType::Connect => {
+            if saturated {
+                format!("O(H × timeout)  [T≥P: all {} ports fit in one async batch]", ports)
+            } else {
+                format!("O(H × ⌈P/T⌉ × timeout)  [⌈{}/{}⌉={} batches per host]", ports, threads, batches)
+            }
+        }
+        ScanType::Syn => format!(
+            "O(H × P × 5ms_delay + 5s_window)  [sequential SYN blast + fixed listen window]"
+        ),
+    };
+
+    out!("\n{}", "─".repeat(60));
+    out!("Performance Analysis");
+    out!("{}", "─".repeat(60));
+    out!("  Scan type          : {:?}", scan_type);
+    out!("  Total hosts given  : {}", total_hosts);
+    out!("  Live hosts scanned : {}", live_hosts);
+    out!("  Ports per host     : {}", ports);
+    out!("  Probe space (H×P)  : {} probes", probe_space);
+    out!("  Concurrency limit  : {} thread(s)", threads);
+    out!("  Timeout per probe  : {}ms", timeout_ms);
+    out!("");
+    out!("  Complexity class   : {}", complexity_note);
+    out!("");
+    out!("  --- Time bounds (connect scan model) ---");
+    out!("  Theoretical serial : {:.2}s  (no concurrency, O(H×P×t))", theoretical_serial_s);
+    out!("  Theoretical min    : {:.2}s  (perfect parallelism, O(H×⌈P/T⌉×t))", theoretical_parallel_s);
+    out!("  Actual scan time   : {:.2}s  (summed per-host)", actual_scan_s);
+    out!("  Efficiency vs min  : {:.1}%", efficiency);
+    out!("  Throughput         : {:.0} probes/s", throughput);
+    out!("");
+    out!("  --- Per-host breakdown ---");
+    out!("  {:<45} {:>10}", "Host", "Scan Time");
+    out!("  {}", "─".repeat(57));
+    for (ip, dur) in host_times {
+        let pps = if dur.as_secs_f64() > 0.0 { ports as f64 / dur.as_secs_f64() } else { f64::INFINITY };
+        out!("  {:<45} {:>7.2}s  ({:.0} p/s)", ip.to_string(), dur.as_secs_f64(), pps);
+    }
+    if host_times.len() > 1 {
+        let times: Vec<f64> = host_times.iter().map(|(_, d)| d.as_secs_f64()).collect();
+        let min = times.iter().cloned().fold(f64::INFINITY, f64::min);
+        let max = times.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        let mean = times.iter().sum::<f64>() / times.len() as f64;
+        out!("  {}", "─".repeat(57));
+        out!("  {:<45} {:>7.2}s  (min)", "", min);
+        out!("  {:<45} {:>7.2}s  (mean)", "", mean);
+        out!("  {:<45} {:>7.2}s  (max)", "", max);
+    }
+    out!("{}", "─".repeat(60));
 }
 
 fn maybe_save(target: &str, report: &str, enabled: bool) {
