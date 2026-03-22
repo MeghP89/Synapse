@@ -24,55 +24,98 @@ pub struct ScanResult {
     pub ports: HashMap<u16, PortStatus>,
 }
 
+
+struct RttEstimator {
+    srtt: f64,   
+    rttvar: f64, 
+    rto: f64,    
+}
+
+impl RttEstimator {
+    fn new() -> Self {
+        Self { srtt: 0.0, rttvar: 0.0, rto: 2000.0 }
+    }
+
+    fn update(&mut self, rtt_ms: f64) {
+        if self.srtt == 0.0 {
+            self.srtt = rtt_ms;
+            self.rttvar = rtt_ms / 2.0;
+        } else {
+            self.rttvar = 0.75 * self.rttvar + 0.25 * (self.srtt - rtt_ms).abs();
+            self.srtt = 0.875 * self.srtt + 0.125 * rtt_ms;
+        }
+        self.rto = (self.srtt + 4.0 * self.rttvar).clamp(200.0, 5000.0);
+    }
+
+    fn timeout(&self) -> Duration {
+        Duration::from_millis(self.rto as u64)
+    }
+}
+
 pub fn stealth_scan(
     dst_ip: IpAddr,
     dst_ports: &[u16],
-    channels: &mut Channels
+    channels: &mut Channels,
 ) -> HashMap<u16, PortStatus> {
     let (local_v4, local_v6) = get_local_ips();
     let src_ip = match dst_ip {
-        IpAddr::V4(_) => {
-            IpAddr::V4(local_v4.expect("no local v4"))
-        }
-        IpAddr::V6(_) => {
-            IpAddr::V6(local_v6.expect("no local v6"))
-        }
+        IpAddr::V4(_) => IpAddr::V4(local_v4.expect("no local v4")),
+        IpAddr::V6(_) => IpAddr::V6(local_v6.expect("no local v6")),
     };
     let (tx, rx) = match dst_ip {
         IpAddr::V4(_) => channels.v4.as_mut().expect("no v4 channel"),
         IpAddr::V6(_) => channels.v6.as_mut().expect("no v6 channel"),
     };
+
     let mut port_map: HashMap<u16, PortStatus> = HashMap::new();
-    for port in dst_ports {
-        let src_port = rand::random_range(49152..65535);
-        let packet = crate::packet::build_tcp_packet(src_ip, dst_ip, src_port, *port, TcpFlags::SYN);
-        let tcp_packet = MutableTcpPacket::owned(packet).unwrap();
-        let _ = tx.send_to(tcp_packet, dst_ip);
-        port_map.insert(*port, PortStatus::Filtered);
-        std::thread::sleep(Duration::from_millis(5));
-    };
-
+    // dst_port -> send timestamp; used to measure RTT per probe
+    let mut in_flight: HashMap<u16, Instant> = HashMap::new();
+    let mut rtt = RttEstimator::new();
     let mut iter = tcp_packet_iter(rx);
-    let deadline = Instant::now() + Duration::from_secs(5);
 
-    while Instant::now() < deadline {
-        match iter.next_with_timeout(Duration::from_millis(100)) {
-            Ok(Some((packet, addr))) => {
-                if addr != dst_ip {
-                    continue;
-                }
+    for &dst_port in dst_ports {
+        let src_port = rand::random_range(49152..65535);
+        let packet = crate::packet::build_tcp_packet(src_ip, dst_ip, src_port, dst_port, TcpFlags::SYN);
+        let _ = tx.send_to(MutableTcpPacket::owned(packet).unwrap(), dst_ip);
+        port_map.insert(dst_port, PortStatus::Filtered);
+        in_flight.insert(dst_port, Instant::now());
 
-                let src_port = packet.get_source();
-                let flags = packet.get_flags();
-
-                if port_map.contains_key(&src_port) {
+        // Opportunistically drain any responses that arrived between sends
+        if let Ok(Some((pkt, addr))) = iter.next_with_timeout(Duration::from_millis(1)) {
+            if addr == dst_ip {
+                let probed_port = pkt.get_source();
+                if let Some(send_time) = in_flight.remove(&probed_port) {
+                    rtt.update(send_time.elapsed().as_secs_f64() * 1000.0);
+                    let flags = pkt.get_flags();
                     if flags & TcpFlags::SYN != 0 && flags & TcpFlags::ACK != 0 {
-                        port_map.insert(src_port, PortStatus::Open);
-                        let packet = crate::packet::build_tcp_packet(src_ip, dst_ip, rand::random_range(49152..65535), src_port, TcpFlags::RST);
-                        let tcp_packet = MutableTcpPacket::owned(packet).unwrap();
-                        let _ = tx.send_to(tcp_packet, dst_ip);
+                        port_map.insert(probed_port, PortStatus::Open);
+                        let rst = crate::packet::build_tcp_packet(src_ip, dst_ip, rand::random_range(49152..65535), probed_port, TcpFlags::RST);
+                        let _ = tx.send_to(MutableTcpPacket::owned(rst).unwrap(), dst_ip);
                     } else if flags & TcpFlags::RST != 0 {
-                        port_map.insert(src_port, PortStatus::Closed);
+                        port_map.insert(probed_port, PortStatus::Closed);
+                    }
+                }
+            }
+        }
+    }
+
+    // Collect remaining in-flight probes; deadline is derived from the RTT model
+    let deadline = Instant::now() + rtt.timeout();
+    while Instant::now() < deadline && !in_flight.is_empty() {
+        match iter.next_with_timeout(Duration::from_millis(50)) {
+            Ok(Some((pkt, addr))) => {
+                if addr == dst_ip {
+                    let probed_port = pkt.get_source();
+                    if let Some(send_time) = in_flight.remove(&probed_port) {
+                        rtt.update(send_time.elapsed().as_secs_f64() * 1000.0);
+                        let flags = pkt.get_flags();
+                        if flags & TcpFlags::SYN != 0 && flags & TcpFlags::ACK != 0 {
+                            port_map.insert(probed_port, PortStatus::Open);
+                            let rst = crate::packet::build_tcp_packet(src_ip, dst_ip, rand::random_range(49152..65535), probed_port, TcpFlags::RST);
+                            let _ = tx.send_to(MutableTcpPacket::owned(rst).unwrap(), dst_ip);
+                        } else if flags & TcpFlags::RST != 0 {
+                            port_map.insert(probed_port, PortStatus::Closed);
+                        }
                     }
                 }
             }
@@ -80,8 +123,9 @@ pub fn stealth_scan(
             Err(e) => println!("Recv error: {}", e),
         }
     }
+
     port_map
-} 
+}
 
 pub async fn connect_scan(
     dst_ip: IpAddr,
