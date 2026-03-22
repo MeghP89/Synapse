@@ -1,6 +1,7 @@
 mod host_discovery;
 use std::net::IpAddr;
 use std::time::Instant;
+use std::collections::HashMap;
 
 use host_discovery::{discover_live_hosts, tcp_syn_discovery};
 
@@ -13,40 +14,46 @@ mod scanner;
 use scanner::{stealth_scan, fin_scan, null_scan, xmas_scan, ack_scan, udp_scan, connect_scan, ScanResult, PortStatus};
 mod packet;
 
-// External
+mod probe;
+use probe::{probe_port, ProbeResult};
+
+mod diff;
+use diff::{ScanSnapshot, HostSnapshot, save_snapshot, load_latest_snapshot, compute_diff, now_timestamp};
+
 use clap::{Parser, ValueEnum};
 
 #[derive(Parser, Debug)]
 #[command(name = "synapse")]
 #[command(about = "A barebones Rust port scanner MVP", long_about = None)]
 struct Args {
-    /// The target IP address or CIDR block (e.g., 192.168.1.1 or 10.0.0.0/24)
     #[arg(short = 't', long)]
     target: String,
 
-    /// Ports to scan (e.g., "80,443" or "1-1024")
     #[arg(short = 'p', long, default_value = "80,23,443,21,22,25,3389,110,445,139,143,53,135,3306,8080,1723,111,995,993,5900")]
     ports: String,
 
-    /// Type of scan to perform
     #[arg(short = 's', long, value_enum, default_value_t = ScanType::Connect)]
     scan_type: ScanType,
 
-    /// Number of concurrent tasks/threads
     #[arg(long, default_value_t = 1000)]
     threads: usize,
 
-    /// Timeout in milliseconds per port connection
     #[arg(long, default_value_t = 500)]
     timeout: u64,
 
-    /// Save results to a file in the results/ folder
     #[arg(short = 'o', long, default_value_t = false)]
     output: bool,
 
-    /// Print a performance/complexity analysis after the scan
     #[arg(long, default_value_t = false)]
     bench: bool,
+
+    /// Probe open ports for TLS cert info and HTTP banners
+    #[arg(long, default_value_t = false)]
+    probe: bool,
+
+    /// Compare this scan against the most recent saved scan for the same target
+    #[arg(long, default_value_t = false)]
+    diff: bool,
 }
 
 #[derive(ValueEnum, Clone, Debug)]
@@ -63,6 +70,8 @@ enum ScanType {
 
 #[tokio::main]
 async fn main() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     let total_start = Instant::now();
     let args = Args::parse();
     let services = ["data/nmap-services", "/usr/local/share/synapse/nmap-services", "/usr/share/nmap/nmap-services"]
@@ -97,11 +106,16 @@ async fn main() {
     }
     let target_ports = parse_ports(&args.ports).unwrap();
 
+    let prev_snapshot = if args.diff {
+        load_latest_snapshot(&args.target)
+    } else {
+        None
+    };
+
     emit!("Starting synapse ({:?} scan) against {} host(s), {} ports | timeout: {}ms | threads: {}",
         args.scan_type, ips.len(), target_ports.len(), args.timeout, args.threads);
     emit!("{}", "─".repeat(60));
 
-    // DNS + host discovery
     let discovery_start = Instant::now();
     let results = dns_resolver(&ips).await;
     let mut icmp_channels = open_icmp(&ips);
@@ -122,7 +136,6 @@ async fn main() {
 
     let discovery_elapsed = discovery_start.elapsed();
 
-    // Collect live hosts
     let live_ips: Vec<IpAddr> = ips.iter()
         .filter(|ip| hosts.get(ip).copied().unwrap_or(false))
         .copied()
@@ -147,7 +160,7 @@ async fn main() {
         return;
     }
 
-    let ip_to_hostname: std::collections::HashMap<IpAddr, &str> = ips.iter()
+    let ip_to_hostname: HashMap<IpAddr, &str> = ips.iter()
         .zip(results.iter())
         .map(|(&ip, hostname)| (ip, hostname.as_str()))
         .collect();
@@ -163,6 +176,7 @@ async fn main() {
     };
 
     let mut host_scan_times: Vec<(IpAddr, std::time::Duration)> = Vec::new();
+    let mut snapshot_hosts: Vec<HostSnapshot> = Vec::new();
 
     for &ip in live_ips.iter() {
         let hostname = ip_to_hostname.get(&ip).map(|s| s.to_string()).unwrap_or_else(|| ip.to_string());
@@ -180,6 +194,24 @@ async fn main() {
         let scan_elapsed = scan_start.elapsed();
 
         host_scan_times.push((ip, scan_elapsed));
+
+        let port_strs: HashMap<u16, String> = ports.iter().map(|(&p, s)| (p, format!("{:?}", s))).collect();
+        snapshot_hosts.push(HostSnapshot { ip: ip.to_string(), hostname: hostname.clone(), ports: port_strs });
+
+        let probe_map: HashMap<u16, ProbeResult> = if args.probe {
+            let open_ports: Vec<u16> = ports.iter()
+                .filter(|(_, s)| **s == PortStatus::Open)
+                .map(|(&p, _)| p)
+                .collect();
+            let mut map = HashMap::new();
+            for port in open_ports {
+                map.insert(port, probe_port(ip, port, args.timeout).await);
+            }
+            map
+        } else {
+            HashMap::new()
+        };
+
         let scan_result = ScanResult { ip, hostname, ports };
 
         let (mut n_open, mut n_closed, mut n_filtered, mut n_open_filtered) = (0usize, 0usize, 0usize, 0usize);
@@ -201,8 +233,13 @@ async fn main() {
         emit!("\nScan report for {}  [{:.2}s]", display, scan_elapsed.as_secs_f64());
         emit!("  {}/{} ports — {} open, {} closed, {} filtered, {} open|filtered",
             target_ports.len(), target_ports.len(), n_open, n_closed, n_filtered, n_open_filtered);
-        emit!("  {:<9} {:<12} {}", "PORT", "STATE", "SERVICE");
-        emit!("  {}", "─".repeat(40));
+
+        if args.probe {
+            emit!("  {:<9} {:<12} {:<14} {}", "PORT", "STATE", "SERVICE", "INFO");
+        } else {
+            emit!("  {:<9} {:<12} {}", "PORT", "STATE", "SERVICE");
+        }
+        emit!("  {}", "─".repeat(if args.probe { 60 } else { 40 }));
 
         let mut all_ports: Vec<_> = scan_result.ports.iter().collect();
         all_ports.sort_by_key(|(port, _)| *port);
@@ -210,12 +247,43 @@ async fn main() {
         for (port, status) in &all_ports {
             let service = services.get(port).map(|s| s.as_str()).unwrap_or("unknown");
             let state_str = format!("{:?}", status);
-            emit!("  {:<9} {:<12} {}", format!("{}/tcp", port), state_str, service);
+            if args.probe {
+                let info = probe_map.get(port).map(format_probe).unwrap_or_default();
+                emit!("  {:<9} {:<12} {:<14} {}", format!("{}/tcp", port), state_str, service, info);
+            } else {
+                emit!("  {:<9} {:<12} {}", format!("{}/tcp", port), state_str, service);
+            }
         }
     }
 
     emit!("\n{}", "─".repeat(60));
     emit!("Scan complete in {:.2}s", total_start.elapsed().as_secs_f64());
+
+    let snapshot = ScanSnapshot {
+        target: args.target.clone(),
+        timestamp: now_timestamp(),
+        hosts: snapshot_hosts,
+    };
+
+    if let Some(prev) = &prev_snapshot {
+        let d = compute_diff(prev, &snapshot);
+        if d.new_hosts.is_empty() && d.lost_hosts.is_empty() && d.port_changes.is_empty() {
+            emit!("\nDiff: no changes since last scan");
+        } else {
+            emit!("\nDiff vs scan from {}", ts_label(prev.timestamp));
+            for h in &d.new_hosts {
+                emit!("  [NEW HOST]  {}", h);
+            }
+            for h in &d.lost_hosts {
+                emit!("  [GONE]      {}", h);
+            }
+            for c in &d.port_changes {
+                emit!("  [CHANGED]   {}:{} {} → {}", c.ip, c.port, c.from, c.to);
+            }
+        }
+    }
+
+    let _ = save_snapshot(&snapshot);
 
     if args.bench {
         emit_bench(
@@ -231,6 +299,57 @@ async fn main() {
     }
 
     maybe_save(&args.target, &report, args.output);
+}
+
+fn format_probe(p: &ProbeResult) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(tls) = &p.tls {
+        parts.push(tls.version.clone());
+        if let Some(cn) = &tls.cn {
+            parts.push(format!("CN:{}", cn));
+        } else if !tls.sans.is_empty() {
+            parts.push(format!("SAN:{}", tls.sans[0]));
+        }
+        if let Some(iss) = &tls.issuer {
+            parts.push(format!("issuer:{}", iss));
+        }
+        if let Some(exp) = &tls.expiry {
+            if tls.expired {
+                parts.push(format!("exp:{} [!]", exp));
+            } else {
+                parts.push(format!("exp:{}", exp));
+            }
+        }
+    }
+    if let Some(http) = &p.http {
+        parts.push(format!("HTTP {}", http.status));
+        if let Some(s) = &http.server {
+            parts.push(s.clone());
+        }
+        if let Some(t) = &http.title {
+            let t = if t.len() > 40 { &t[..40] } else { t.as_str() };
+            parts.push(format!("\"{}\"", t));
+        }
+    }
+    parts.join(" | ")
+}
+
+fn ts_label(ts: u64) -> String {
+    let secs = ts as i64;
+    let z = secs / 86400 + 719468;
+    let era = (if z >= 0 { z } else { z - 146096 }) / 146097;
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if m <= 2 { y + 1 } else { y };
+    let time_of_day = secs % 86400;
+    let h = time_of_day / 3600;
+    let min = (time_of_day % 3600) / 60;
+    format!("{:04}-{:02}-{:02} {:02}:{:02}", year, m, d, h, min)
 }
 
 fn emit_bench(
@@ -254,18 +373,12 @@ fn emit_bench(
 
     let probe_space = live_hosts * ports;
     let timeout_s = timeout_ms as f64 / 1000.0;
-
-    // Theoretical bounds for connect scan.
-    // Serial: every probe waits up to timeout — O(H × P × timeout)
     let theoretical_serial_s = live_hosts as f64 * ports as f64 * timeout_s;
-    // Parallel: ports are batched across threads — O(H × ceil(P/T) × timeout)
-    let batches = (ports + threads - 1) / threads; // ceil(P/T)
+    let batches = (ports + threads - 1) / threads;
     let theoretical_parallel_s = live_hosts as f64 * batches as f64 * timeout_s;
 
     let actual_scan_s: f64 = host_times.iter().map(|(_, d)| d.as_secs_f64()).sum();
     let throughput = if actual_scan_s > 0.0 { probe_space as f64 / actual_scan_s } else { f64::INFINITY };
-
-    // Efficiency: how close actual is to the theoretical parallel lower bound (capped at 100%)
     let efficiency = if actual_scan_s > 0.0 {
         (theoretical_parallel_s / actual_scan_s * 100.0).min(100.0)
     } else {
