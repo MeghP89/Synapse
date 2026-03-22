@@ -2,7 +2,7 @@ mod host_discovery;
 use std::net::IpAddr;
 use std::time::Instant;
 
-use host_discovery::discover_live_hosts;
+use host_discovery::{discover_live_hosts, tcp_syn_discovery};
 
 mod utils;
 use utils::{parse_ports, master_target_parser, dns_resolver, load_services,
@@ -10,7 +10,7 @@ use utils::{parse_ports, master_target_parser, dns_resolver, load_services,
 use packet::{open_icmp, open_tcp};
 
 mod scanner;
-use scanner::{stealth_scan, connect_scan, ScanResult, PortStatus};
+use scanner::{stealth_scan, fin_scan, null_scan, xmas_scan, ack_scan, udp_scan, connect_scan, ScanResult, PortStatus};
 mod packet;
 
 // External
@@ -53,6 +53,11 @@ struct Args {
 enum ScanType {
     Connect,
     Syn,
+    Fin,
+    Null,
+    Xmas,
+    Ack,
+    Udp,
 }
 
 
@@ -60,7 +65,10 @@ enum ScanType {
 async fn main() {
     let total_start = Instant::now();
     let args = Args::parse();
-    let services = load_services("data/nmap-services");
+    let services = ["data/nmap-services", "/usr/local/share/synapse/nmap-services", "/usr/share/nmap/nmap-services"]
+        .iter()
+        .find_map(|p| { let m = load_services(p); if m.is_empty() { None } else { Some(m) } })
+        .unwrap_or_default();
 
     let mut report = String::new();
     macro_rules! emit {
@@ -97,7 +105,21 @@ async fn main() {
     let discovery_start = Instant::now();
     let results = dns_resolver(&ips).await;
     let mut icmp_channels = open_icmp(&ips);
-    let hosts = discover_live_hosts(&ips, &mut icmp_channels);
+    let mut hosts = discover_live_hosts(&ips, &mut icmp_channels);
+
+    let icmp_down: Vec<IpAddr> = ips.iter()
+        .filter(|ip| !hosts.get(ip).copied().unwrap_or(false))
+        .copied()
+        .collect();
+    if !icmp_down.is_empty() {
+        let mut tcp_disc = open_tcp(&icmp_down);
+        for (ip, alive) in tcp_syn_discovery(&icmp_down, &mut tcp_disc) {
+            if alive {
+                hosts.insert(ip, true);
+            }
+        }
+    }
+
     let discovery_elapsed = discovery_start.elapsed();
 
     // Collect live hosts
@@ -133,9 +155,11 @@ async fn main() {
     emit!("\n{} live host(s) to scan", live_ips.len());
     emit!("{}", "─".repeat(60));
 
-    let mut tcp_channels = match args.scan_type {
-        ScanType::Syn => Some(open_tcp(&live_ips)),
-        ScanType::Connect => None,
+    let needs_raw_tcp = matches!(args.scan_type, ScanType::Syn | ScanType::Fin | ScanType::Null | ScanType::Xmas | ScanType::Ack);
+    let mut tcp_channels = if needs_raw_tcp {
+        Some(open_tcp(&live_ips))
+    } else {
+        None
     };
 
     let mut host_scan_times: Vec<(IpAddr, std::time::Duration)> = Vec::new();
@@ -145,7 +169,12 @@ async fn main() {
 
         let scan_start = Instant::now();
         let ports = match args.scan_type {
-            ScanType::Syn => stealth_scan(ip, &target_ports, tcp_channels.as_mut().unwrap()),
+            ScanType::Syn     => stealth_scan(ip, &target_ports, tcp_channels.as_mut().unwrap()),
+            ScanType::Fin     => fin_scan(ip, &target_ports, tcp_channels.as_mut().unwrap()),
+            ScanType::Null    => null_scan(ip, &target_ports, tcp_channels.as_mut().unwrap()),
+            ScanType::Xmas    => xmas_scan(ip, &target_ports, tcp_channels.as_mut().unwrap()),
+            ScanType::Ack     => ack_scan(ip, &target_ports, tcp_channels.as_mut().unwrap()),
+            ScanType::Udp     => udp_scan(ip, &target_ports, args.timeout, args.threads).await,
             ScanType::Connect => connect_scan(ip, &target_ports, args.timeout, args.threads).await,
         };
         let scan_elapsed = scan_start.elapsed();
@@ -153,12 +182,13 @@ async fn main() {
         host_scan_times.push((ip, scan_elapsed));
         let scan_result = ScanResult { ip, hostname, ports };
 
-        let (mut n_open, mut n_closed, mut n_filtered) = (0usize, 0usize, 0usize);
+        let (mut n_open, mut n_closed, mut n_filtered, mut n_open_filtered) = (0usize, 0usize, 0usize, 0usize);
         for status in scan_result.ports.values() {
             match status {
-                PortStatus::Open     => n_open += 1,
-                PortStatus::Closed   => n_closed += 1,
-                PortStatus::Filtered => n_filtered += 1,
+                PortStatus::Open         => n_open += 1,
+                PortStatus::Closed       => n_closed += 1,
+                PortStatus::Filtered     => n_filtered += 1,
+                PortStatus::OpenFiltered => n_open_filtered += 1,
             }
         }
 
@@ -169,8 +199,8 @@ async fn main() {
         };
 
         emit!("\nScan report for {}  [{:.2}s]", display, scan_elapsed.as_secs_f64());
-        emit!("  {}/{} ports — {} open, {} closed, {} filtered",
-            target_ports.len(), target_ports.len(), n_open, n_closed, n_filtered);
+        emit!("  {}/{} ports — {} open, {} closed, {} filtered, {} open|filtered",
+            target_ports.len(), target_ports.len(), n_open, n_closed, n_filtered, n_open_filtered);
         emit!("  {:<9} {:<12} {}", "PORT", "STATE", "SERVICE");
         emit!("  {}", "─".repeat(40));
 
@@ -251,9 +281,16 @@ fn emit_bench(
                 format!("O(H × ⌈P/T⌉ × timeout)  [⌈{}/{}⌉={} batches per host]", ports, threads, batches)
             }
         }
-        ScanType::Syn => format!(
-            "O(H × P × 5ms_delay + 5s_window)  [sequential SYN blast + fixed listen window]"
+        ScanType::Syn | ScanType::Fin | ScanType::Null | ScanType::Xmas | ScanType::Ack => format!(
+            "O(H × P × 5ms_delay + 5s_window)  [sequential raw blast + fixed listen window]"
         ),
+        ScanType::Udp => {
+            if saturated {
+                format!("O(H × timeout)  [T≥P: all {} ports fit in one async batch, UDP]", ports)
+            } else {
+                format!("O(H × ⌈P/T⌉ × timeout)  [⌈{}/{}⌉={} batches per host, UDP]", ports, threads, batches)
+            }
+        }
     };
 
     out!("\n{}", "─".repeat(60));

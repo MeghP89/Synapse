@@ -10,12 +10,14 @@ use pnet::transport::tcp_packet_iter;
 use pnet::{datalink, packet::tcp::MutableTcpPacket};
 use tokio::sync::Semaphore;
 use tokio::time::{timeout, Duration};
-use tokio::net::TcpStream;
+use tokio::net::{TcpStream, UdpSocket};
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum PortStatus {
     Open,
     Closed,
     Filtered,
+    OpenFiltered,
 }
 
 pub struct ScanResult {
@@ -26,9 +28,9 @@ pub struct ScanResult {
 
 
 struct RttEstimator {
-    srtt: f64,   
-    rttvar: f64, 
-    rto: f64,    
+    srtt: f64,
+    rttvar: f64,
+    rto: f64,
 }
 
 impl RttEstimator {
@@ -52,10 +54,47 @@ impl RttEstimator {
     }
 }
 
-pub fn stealth_scan(
+#[derive(Clone, Copy)]
+enum ScanMode {
+    Syn,
+    FinNullXmas,
+    Ack,
+}
+
+fn classify_response(flags: u8, mode: ScanMode) -> Option<PortStatus> {
+    match mode {
+        ScanMode::Syn => {
+            if flags & TcpFlags::SYN != 0 && flags & TcpFlags::ACK != 0 {
+                Some(PortStatus::Open)
+            } else if flags & TcpFlags::RST != 0 {
+                Some(PortStatus::Closed)
+            } else {
+                None
+            }
+        }
+        ScanMode::FinNullXmas => {
+            if flags & TcpFlags::RST != 0 {
+                Some(PortStatus::Closed)
+            } else {
+                None
+            }
+        }
+        ScanMode::Ack => {
+            if flags & TcpFlags::RST != 0 {
+                Some(PortStatus::Open)
+            } else {
+                None
+            }
+        }
+    }
+}
+
+fn raw_tcp_scan(
     dst_ip: IpAddr,
     dst_ports: &[u16],
     channels: &mut Channels,
+    flags: u8,
+    mode: ScanMode,
 ) -> HashMap<u16, PortStatus> {
     let (local_v4, local_v6) = get_local_ips();
     let src_ip = match dst_ip {
@@ -67,38 +106,41 @@ pub fn stealth_scan(
         IpAddr::V6(_) => channels.v6.as_mut().expect("no v6 channel"),
     };
 
+    let default_status = match mode {
+        ScanMode::Syn | ScanMode::Ack => PortStatus::Filtered,
+        ScanMode::FinNullXmas => PortStatus::OpenFiltered,
+    };
+
     let mut port_map: HashMap<u16, PortStatus> = HashMap::with_capacity(dst_ports.len());
     let mut in_flight: HashMap<u16, Instant> = HashMap::with_capacity(dst_ports.len());
     let mut rtt = RttEstimator::new();
     let mut iter = tcp_packet_iter(rx);
 
     for &dst_port in dst_ports {
-        let src_port = rand::random_range(49152..65535);
-        let packet = crate::packet::build_tcp_packet(src_ip, dst_ip, src_port, dst_port, TcpFlags::SYN);
+        let src_port = rand::random_range(49152..65535u16);
+        let packet = crate::packet::build_tcp_packet(src_ip, dst_ip, src_port, dst_port, flags);
         let _ = tx.send_to(MutableTcpPacket::owned(packet).unwrap(), dst_ip);
-        port_map.insert(dst_port, PortStatus::Filtered);
+        port_map.insert(dst_port, default_status.clone());
         in_flight.insert(dst_port, Instant::now());
 
-        // Opportunistically drain any responses that arrived between sends
         if let Ok(Some((pkt, addr))) = iter.next_with_timeout(Duration::from_millis(1)) {
             if addr == dst_ip {
                 let probed_port = pkt.get_source();
                 if let Some(send_time) = in_flight.remove(&probed_port) {
                     rtt.update(send_time.elapsed().as_secs_f64() * 1000.0);
-                    let flags = pkt.get_flags();
-                    if flags & TcpFlags::SYN != 0 && flags & TcpFlags::ACK != 0 {
-                        port_map.insert(probed_port, PortStatus::Open);
-                        let rst = crate::packet::build_tcp_packet(src_ip, dst_ip, rand::random_range(49152..65535), probed_port, TcpFlags::RST);
-                        let _ = tx.send_to(MutableTcpPacket::owned(rst).unwrap(), dst_ip);
-                    } else if flags & TcpFlags::RST != 0 {
-                        port_map.insert(probed_port, PortStatus::Closed);
+                    let pkt_flags = pkt.get_flags();
+                    if let Some(status) = classify_response(pkt_flags, mode) {
+                        if matches!(mode, ScanMode::Syn) && status == PortStatus::Open {
+                            let rst = crate::packet::build_tcp_packet(src_ip, dst_ip, rand::random_range(49152..65535u16), probed_port, TcpFlags::RST);
+                            let _ = tx.send_to(MutableTcpPacket::owned(rst).unwrap(), dst_ip);
+                        }
+                        port_map.insert(probed_port, status);
                     }
                 }
             }
         }
     }
 
-    // Collect remaining in-flight probes; deadline is derived from the RTT model
     let deadline = Instant::now() + rtt.timeout();
     while Instant::now() < deadline && !in_flight.is_empty() {
         match iter.next_with_timeout(Duration::from_millis(50)) {
@@ -107,13 +149,13 @@ pub fn stealth_scan(
                     let probed_port = pkt.get_source();
                     if let Some(send_time) = in_flight.remove(&probed_port) {
                         rtt.update(send_time.elapsed().as_secs_f64() * 1000.0);
-                        let flags = pkt.get_flags();
-                        if flags & TcpFlags::SYN != 0 && flags & TcpFlags::ACK != 0 {
-                            port_map.insert(probed_port, PortStatus::Open);
-                            let rst = crate::packet::build_tcp_packet(src_ip, dst_ip, rand::random_range(49152..65535), probed_port, TcpFlags::RST);
-                            let _ = tx.send_to(MutableTcpPacket::owned(rst).unwrap(), dst_ip);
-                        } else if flags & TcpFlags::RST != 0 {
-                            port_map.insert(probed_port, PortStatus::Closed);
+                        let pkt_flags = pkt.get_flags();
+                        if let Some(status) = classify_response(pkt_flags, mode) {
+                            if matches!(mode, ScanMode::Syn) && status == PortStatus::Open {
+                                let rst = crate::packet::build_tcp_packet(src_ip, dst_ip, rand::random_range(49152..65535u16), probed_port, TcpFlags::RST);
+                                let _ = tx.send_to(MutableTcpPacket::owned(rst).unwrap(), dst_ip);
+                            }
+                            port_map.insert(probed_port, status);
                         }
                     }
                 }
@@ -126,11 +168,106 @@ pub fn stealth_scan(
     port_map
 }
 
+pub fn stealth_scan(
+    dst_ip: IpAddr,
+    dst_ports: &[u16],
+    channels: &mut Channels,
+) -> HashMap<u16, PortStatus> {
+    raw_tcp_scan(dst_ip, dst_ports, channels, TcpFlags::SYN, ScanMode::Syn)
+}
+
+pub fn fin_scan(
+    dst_ip: IpAddr,
+    dst_ports: &[u16],
+    channels: &mut Channels,
+) -> HashMap<u16, PortStatus> {
+    raw_tcp_scan(dst_ip, dst_ports, channels, TcpFlags::FIN, ScanMode::FinNullXmas)
+}
+
+pub fn null_scan(
+    dst_ip: IpAddr,
+    dst_ports: &[u16],
+    channels: &mut Channels,
+) -> HashMap<u16, PortStatus> {
+    raw_tcp_scan(dst_ip, dst_ports, channels, 0, ScanMode::FinNullXmas)
+}
+
+pub fn xmas_scan(
+    dst_ip: IpAddr,
+    dst_ports: &[u16],
+    channels: &mut Channels,
+) -> HashMap<u16, PortStatus> {
+    raw_tcp_scan(
+        dst_ip,
+        dst_ports,
+        channels,
+        TcpFlags::FIN | TcpFlags::PSH | TcpFlags::URG,
+        ScanMode::FinNullXmas,
+    )
+}
+
+pub fn ack_scan(
+    dst_ip: IpAddr,
+    dst_ports: &[u16],
+    channels: &mut Channels,
+) -> HashMap<u16, PortStatus> {
+    raw_tcp_scan(dst_ip, dst_ports, channels, TcpFlags::ACK, ScanMode::Ack)
+}
+
+pub async fn udp_scan(
+    dst_ip: IpAddr,
+    dst_ports: &[u16],
+    timeout_ms: u64,
+    max_threads: usize,
+) -> HashMap<u16, PortStatus> {
+    let semaphore = Arc::new(Semaphore::new(max_threads));
+    let mut handles = Vec::with_capacity(dst_ports.len());
+
+    for &port in dst_ports {
+        let sem = semaphore.clone();
+        let handle = tokio::spawn(async move {
+            let _permit = sem.acquire().await.unwrap();
+            let bind_addr: SocketAddr = if dst_ip.is_ipv4() {
+                "0.0.0.0:0".parse().unwrap()
+            } else {
+                "[::]:0".parse().unwrap()
+            };
+            let status = match UdpSocket::bind(bind_addr).await {
+                Ok(sock) => {
+                    let target = SocketAddr::new(dst_ip, port);
+                    if sock.connect(target).await.is_err() {
+                        return (port, PortStatus::Filtered);
+                    }
+                    let _ = sock.send(&[]).await;
+                    let mut buf = [0u8; 512];
+                    match timeout(Duration::from_millis(timeout_ms), sock.recv(&mut buf)).await {
+                        Ok(Ok(_)) => PortStatus::Open,
+                        Ok(Err(e)) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
+                            PortStatus::Closed
+                        }
+                        _ => PortStatus::Filtered,
+                    }
+                }
+                Err(_) => PortStatus::Filtered,
+            };
+            (port, status)
+        });
+        handles.push(handle);
+    }
+
+    let mut results = HashMap::with_capacity(dst_ports.len());
+    for handle in handles {
+        let (port, status) = handle.await.unwrap();
+        results.insert(port, status);
+    }
+    results
+}
+
 pub async fn connect_scan(
     dst_ip: IpAddr,
     dst_ports: &[u16],
     timeout_ms: u64,
-    max_threads: usize, 
+    max_threads: usize,
 ) -> HashMap<u16, PortStatus> {
     let semaphore = Arc::new(Semaphore::new(max_threads));
     let mut handles = Vec::with_capacity(dst_ports.len());
@@ -165,7 +302,7 @@ pub async fn connect_scan(
     results
 }
 
-fn get_local_ips() -> (Option<std::net::Ipv4Addr>, Option<std::net::Ipv6Addr>) {
+pub(crate) fn get_local_ips() -> (Option<std::net::Ipv4Addr>, Option<std::net::Ipv6Addr>) {
     let mut v4 = None;
     let mut v6 = None;
 
@@ -188,4 +325,3 @@ fn get_local_ips() -> (Option<std::net::Ipv4Addr>, Option<std::net::Ipv6Addr>) {
 
     (v4, v6)
 }
-

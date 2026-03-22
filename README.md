@@ -1,31 +1,42 @@
 # synapse
 
-A fast, barebones Rust version of NMap. Supports raw SYN (stealth) scanning and TCP connect scanning, with ICMP host discovery, PTR DNS resolution, and service name lookup.
+A fast, barebones Rust port scanner. Supports multiple raw TCP scan techniques, UDP scanning, ICMP + TCP SYN host discovery, PTR DNS resolution, and service name lookup.
+
+---
+
+## Install
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/meghp89/synapse/main/install.sh | bash
+```
+
+Downloads a pre-built binary for your platform. Falls back to building from source (requires Rust) if no binary is available. The `nmap-services` data file is installed to `/usr/local/share/synapse/`.
 
 ---
 
 ## Features
 
-- **SYN scan** — raw TCP SYN packets via `pnet`, never completes the handshake
+- **SYN scan** — raw TCP SYN, never completes the handshake
+- **FIN / NULL / XMAS scans** — RFC-compliant evasion techniques; report `open|filtered` vs `closed`
+- **ACK scan** — maps firewall rules rather than port state
+- **UDP scan** — async UDP probe with ICMP port-unreachable detection
 - **Connect scan** — full TCP connect, async with configurable concurrency
-- **ICMP host discovery** — pings targets before scanning, skips dead hosts
-- **PTR DNS resolution** — reverse-resolves IPs to hostnames via Cloudflare (`1.1.1.1`)
-- **Service lookup** — maps open ports to service names from `data/nmap-services`
+- **ICMP host discovery** — ping sweep before scanning, skips dead hosts
+- **TCP SYN discovery** — fallback discovery for hosts that block ICMP
+- **PTR DNS resolution** — reverse-resolves IPs to hostnames
+- **Service lookup** — maps open ports to service names from `nmap-services`
 - **Flexible targeting** — single IP, CIDR blocks, octet ranges (e.g. `10.0.0.1-50`), or hostnames
-- **Sensitive DNS exclusions** — hardcoded list of public DNS infrastructure that is always excluded from scans
-- **Timing** — per-host scan time and total elapsed time printed in output
+- **Sensitive DNS exclusions** — public DNS infrastructure always excluded from scans
 
 ---
 
 ## Requirements
 
-- Rust (edition 2024)
-- **Root / CAP_NET_RAW** required for SYN scan and ICMP host discovery (raw sockets)
-- `data/nmap-services` file present at runtime (standard nmap-services format)
+- **Root / CAP_NET_RAW** required for all raw socket scan types (SYN, FIN, NULL, XMAS, ACK) and ICMP discovery
 
 ---
 
-## Build
+## Build from source
 
 ```bash
 cargo build --release
@@ -36,7 +47,7 @@ cargo build --release
 ## Usage
 
 ```
-sudo ./target/release/synapse [OPTIONS] --target <TARGET>
+sudo synapse [OPTIONS] --target <TARGET>
 ```
 
 ### Options
@@ -45,25 +56,44 @@ sudo ./target/release/synapse [OPTIONS] --target <TARGET>
 |------|-------|---------|-------------|
 | `--target` | `-t` | *(required)* | IP, hostname, CIDR, or octet range |
 | `--ports` | `-p` | Top 20 common ports | Comma-separated or range (e.g. `80,443` or `1-1024`) |
-| `--scan-type` | `-s` | `connect` | `connect` or `syn` |
-| `--threads` | | `1000` | Max concurrent tasks (connect scan) |
+| `--scan-type` | `-s` | `connect` | `connect`, `syn`, `fin`, `null`, `xmas`, `ack`, `udp` |
+| `--threads` | | `1000` | Max concurrent tasks |
 | `--timeout` | | `500` | Timeout per port in milliseconds |
-| `--output` | `t` | `true` | Output results to a results dir |
+| `--output` | `-o` | `false` | Save results to `results/` |
+| `--bench` | | `false` | Print performance analysis |
+
+### Scan types
+
+| Type | Flags sent | Requires root | Use case |
+|------|-----------|---------------|----------|
+| `connect` | — | No | Default; full TCP handshake |
+| `syn` | SYN | Yes | Half-open; faster and less logged |
+| `fin` | FIN | Yes | Evasion; bypasses some firewalls |
+| `null` | *(none)* | Yes | Evasion; same semantics as FIN |
+| `xmas` | FIN+PSH+URG | Yes | Evasion; same semantics as FIN |
+| `ack` | ACK | Yes | Firewall mapping, not port state |
+| `udp` | — (UDP) | No | UDP service discovery |
 
 ### Examples
 
 ```bash
-# TCP connect scan a single host on default ports
-sudo ./target/release/synapse -t 192.168.1.1
+# TCP connect scan on default ports
+sudo synapse -t 192.168.1.1
 
 # SYN scan a /24 subnet on ports 22, 80, 443
-sudo ./target/release/synapse -t 10.0.0.0/24 -p 22,80,443 -s syn
+sudo synapse -t 10.0.0.0/24 -p 22,80,443 -s syn
 
-# Octet range scan
-sudo ./target/release/synapse -t 192.168.1.1-50 -p 1-1024
+# FIN scan to evade basic stateless firewalls
+sudo synapse -t 10.0.0.1 -p 1-1024 -s fin
 
-# Scan a hostname with increased timeout
-sudo ./target/release/synapse -t example.com --timeout 1000
+# ACK scan to map firewall rules
+sudo synapse -t 10.0.0.1 -p 22,80,443 -s ack
+
+# UDP scan common ports
+sudo synapse -t 10.0.0.1 -p 53,67,123,161,500 -s udp
+
+# Octet range scan with output saved
+sudo synapse -t 192.168.1.1-50 -p 1-1024 -o
 ```
 
 ---
@@ -100,9 +130,9 @@ Scan complete in 3.71s
 | File | Responsibility |
 |------|---------------|
 | `main.rs` | CLI parsing, orchestration, output formatting |
-| `scanner.rs` | `stealth_scan` (SYN) and `connect_scan` (TCP connect) |
+| `scanner.rs` | All scan types: SYN, FIN, NULL, XMAS, ACK, UDP, connect |
 | `packet.rs` | Raw packet construction and transport channel management |
-| `host_discovery.rs` | ICMP echo blast-and-collect with progress bar |
+| `host_discovery.rs` | ICMP ping sweep + TCP SYN fallback discovery |
 | `utils.rs` | Target parsing, port parsing, DNS resolution, service loading, exclusions |
 
 ---
