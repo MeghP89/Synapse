@@ -11,14 +11,11 @@ pub fn load_services(path: &str) -> HashMap<u16, String> {
         if line.starts_with('#') || line.is_empty() {
             continue;
         }
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() >= 2 {
-            let name = parts[0];
-            if let Some((port_str, proto)) = parts[1].split_once('/') {
-                if proto == "tcp" {
-                    if let Ok(port) = port_str.parse::<u16>() {
-                        services.insert(port, name.to_string());
-                    }
+        let mut parts = line.split_whitespace();
+        if let (Some(name), Some(port_proto)) = (parts.next(), parts.next()) {
+            if let Some((port_str, "tcp")) = port_proto.split_once('/') {
+                if let Ok(port) = port_str.parse::<u16>() {
+                    services.insert(port, name.to_string());
                 }
             }
         }
@@ -31,21 +28,15 @@ pub fn parse_ports(port_str: &str) -> Result<Vec<u16>, String> {
     let mut ports = Vec::new();
 
     for part in port_str.split(',') {
-        if part.contains('-') {
-            let bounds: Vec<&str> = part.split('-').collect();
-            if bounds.len() != 2 {
-                return Err(format!("Invalid range format: {}", part));
-            }
-            let start = bounds[0].parse::<u16>()
-                .map_err(|_| format!("Invalid start port: {}", bounds[0]))?;
-            let end = bounds[1].parse::<u16>()
-                .map_err(|_| format!("Invalid end port: {}", bounds[1]))?;
+        if let Some((start_str, end_str)) = part.split_once('-') {
+            let start = start_str.parse::<u16>()
+                .map_err(|_| format!("Invalid start port: {}", start_str))?;
+            let end = end_str.parse::<u16>()
+                .map_err(|_| format!("Invalid end port: {}", end_str))?;
             if start > end {
                 return Err(format!("Start port greater than end port: {}", part));
             }
-            for p in start..=end {
-                ports.push(p);
-            }
+            ports.extend(start..=end);
         } else {
             let port = part.parse::<u16>()
                 .map_err(|_| format!("Invalid single port: {}", part))?;
@@ -149,7 +140,7 @@ fn parse_octet_range(target: &str) -> Result<Vec<IpAddr>, String> {
     let octet3 = parse_octet_part(parts[2])?;
     let octet4 = parse_octet_part(parts[3])?;
 
-    let mut generated_ips = Vec::new();
+    let mut generated_ips = Vec::with_capacity(octet1.len() * octet2.len() * octet3.len() * octet4.len());
 
     for &o1 in &octet1 {
         for &o2 in &octet2 {
@@ -206,38 +197,23 @@ pub fn save_results(target: &str, content: &str) -> Result<String, std::io::Erro
 }
 
 pub fn master_target_parser(input: &str) -> Result<Vec<IpAddr>, String> {
-    let mut final_ips = Vec::new();
-
     if input.contains('-') || input.contains(',') {
-        let generated_ips = parse_octet_range(input)?;
-        final_ips.extend(generated_ips);
-
-    } else {
-        
-        let networks = parse_target_addr(input)?;
-        
-        for network in networks {
-            for ip in network.iter() {
-                final_ips.push(ip);
-            }
-        }
+        return parse_octet_range(input);
     }
-
-    Ok(final_ips)
+    let networks = parse_target_addr(input)?;
+    Ok(networks.into_iter().flat_map(|n| n.iter()).collect())
 }
 
-pub async fn dns_resolver(input: &Vec<IpAddr>) -> Vec<String> {
-    let mut handles: Vec<tokio::task::JoinHandle<String>> = Vec::new();
+pub async fn dns_resolver(input: &[IpAddr]) -> Vec<String> {
+    let mut handles: Vec<tokio::task::JoinHandle<String>> = Vec::with_capacity(input.len());
 
-    for ip in input {
-        let ip = *ip;
-        let handle = tokio::spawn(async move {
+    for &ip in input {
+        handles.push(tokio::spawn(async move {
             resolver(ip).unwrap_or_else(|_| ip.to_string())
-        });
-        handles.push(handle);
+        }));
     }
 
-    let mut resolved_addresses: Vec<String> = Vec::new();
+    let mut resolved_addresses = Vec::with_capacity(handles.len());
     for handle in handles {
         resolved_addresses.push(handle.await.unwrap());
     }
@@ -251,17 +227,15 @@ fn resolver(input: IpAddr) -> Result<String, Box<dyn std::error::Error>> {
             format!("{}.{}.{}.{}.in-addr.arpa", o[3], o[2], o[1], o[0])
         }
         IpAddr::V6(v6) => {
-            let nibbles: Vec<String> = v6.octets()
-                .iter()
-                .rev()
-                .flat_map(|byte| {
-                    vec![
-                        format!("{:x}", byte & 0x0F),
-                        format!("{:x}", (byte >> 4) & 0x0F),
-                    ]
-                })
-                .collect();
-            format!("{}.ip6.arpa", nibbles.join("."))
+            const HEX: &[u8] = b"0123456789abcdef";
+            let mut nibbles = String::with_capacity(63);
+            for (i, byte) in v6.octets().iter().rev().enumerate() {
+                if i > 0 { nibbles.push('.'); }
+                nibbles.push(HEX[(byte & 0x0F) as usize] as char);
+                nibbles.push('.');
+                nibbles.push(HEX[((byte >> 4) & 0x0F) as usize] as char);
+            }
+            format!("{}.ip6.arpa", nibbles)
         }
     };
     let query = build_query(&arpa_domain, 12);
@@ -274,7 +248,7 @@ fn resolver(input: IpAddr) -> Result<String, Box<dyn std::error::Error>> {
 }
 
 fn build_query(domain: &str, record_type: u16) -> Vec<u8> {
-    let mut buf = Vec::new();
+    let mut buf = Vec::with_capacity(domain.len() + 20);
 
     buf.extend_from_slice(&rand::random::<u16>().to_be_bytes()); 
     buf.extend_from_slice(&0x0100u16.to_be_bytes()); 

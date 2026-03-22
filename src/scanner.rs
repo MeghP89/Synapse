@@ -67,9 +67,8 @@ pub fn stealth_scan(
         IpAddr::V6(_) => channels.v6.as_mut().expect("no v6 channel"),
     };
 
-    let mut port_map: HashMap<u16, PortStatus> = HashMap::new();
-    // dst_port -> send timestamp; used to measure RTT per probe
-    let mut in_flight: HashMap<u16, Instant> = HashMap::new();
+    let mut port_map: HashMap<u16, PortStatus> = HashMap::with_capacity(dst_ports.len());
+    let mut in_flight: HashMap<u16, Instant> = HashMap::with_capacity(dst_ports.len());
     let mut rtt = RttEstimator::new();
     let mut iter = tcp_packet_iter(rx);
 
@@ -134,7 +133,7 @@ pub async fn connect_scan(
     max_threads: usize, 
 ) -> HashMap<u16, PortStatus> {
     let semaphore = Arc::new(Semaphore::new(max_threads));
-    let mut handles = Vec::new();
+    let mut handles = Vec::with_capacity(dst_ports.len());
     for &port in dst_ports {
         let sem = semaphore.clone();
         let handle = tokio::spawn(async move {
@@ -158,7 +157,7 @@ pub async fn connect_scan(
         });
         handles.push(handle);
     }
-    let mut results = HashMap::new();
+    let mut results = HashMap::with_capacity(dst_ports.len());
     for handle in handles {
         let (port, status) = handle.await.unwrap();
         results.insert(port, status);

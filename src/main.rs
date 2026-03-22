@@ -125,10 +125,14 @@ async fn main() {
         return;
     }
 
+    let ip_to_hostname: std::collections::HashMap<IpAddr, &str> = ips.iter()
+        .zip(results.iter())
+        .map(|(&ip, hostname)| (ip, hostname.as_str()))
+        .collect();
+
     emit!("\n{} live host(s) to scan", live_ips.len());
     emit!("{}", "─".repeat(60));
 
-    // Port Scanning
     let mut tcp_channels = match args.scan_type {
         ScanType::Syn => Some(open_tcp(&live_ips)),
         ScanType::Connect => None,
@@ -137,10 +141,7 @@ async fn main() {
     let mut host_scan_times: Vec<(IpAddr, std::time::Duration)> = Vec::new();
 
     for &ip in live_ips.iter() {
-        let hostname = ips.iter()
-            .position(|&x| x == ip)
-            .map(|idx| results[idx].clone())
-            .unwrap_or(ip.to_string());
+        let hostname = ip_to_hostname.get(&ip).map(|s| s.to_string()).unwrap_or_else(|| ip.to_string());
 
         let scan_start = Instant::now();
         let ports = match args.scan_type {
@@ -152,9 +153,14 @@ async fn main() {
         host_scan_times.push((ip, scan_elapsed));
         let scan_result = ScanResult { ip, hostname, ports };
 
-        let n_open     = scan_result.ports.values().filter(|s| **s == PortStatus::Open).count();
-        let n_closed   = scan_result.ports.values().filter(|s| **s == PortStatus::Closed).count();
-        let n_filtered = scan_result.ports.values().filter(|s| **s == PortStatus::Filtered).count();
+        let (mut n_open, mut n_closed, mut n_filtered) = (0usize, 0usize, 0usize);
+        for status in scan_result.ports.values() {
+            match status {
+                PortStatus::Open     => n_open += 1,
+                PortStatus::Closed   => n_closed += 1,
+                PortStatus::Filtered => n_filtered += 1,
+            }
+        }
 
         let display = if scan_result.hostname == ip.to_string() {
             ip.to_string()

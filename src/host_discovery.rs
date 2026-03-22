@@ -12,8 +12,7 @@ pub fn discover_live_hosts(ips: &[IpAddr], channels: &mut Channels) -> HashMap<I
     let mut results: HashMap<IpAddr, bool> = HashMap::new();
     let bar = ProgressBar::new(ips.len() as u64);
 
-    let v4_ips: Vec<IpAddr> = ips.iter().filter(|ip| ip.is_ipv4()).copied().collect();
-    let v6_ips: Vec<IpAddr> = ips.iter().filter(|ip| ip.is_ipv6()).copied().collect();
+    let (v4_ips, v6_ips): (Vec<IpAddr>, Vec<IpAddr>) = ips.iter().copied().partition(|ip| ip.is_ipv4());
 
     if !v4_ips.is_empty() {
         if let Some((tx, rx)) = channels.v4.as_mut() {
@@ -46,14 +45,18 @@ fn blast_and_collect(
 
     let mut iter = icmp_packet_iter(rx);
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    let mut remaining = ips.len();
 
-    while std::time::Instant::now() < deadline {
+    while std::time::Instant::now() < deadline && remaining > 0 {
         match iter.next_with_timeout(std::time::Duration::from_millis(100)) {
             Ok(Some((packet, addr))) => {
                 if packet.get_icmp_type() == IcmpTypes::EchoReply {
-                    if results.contains_key(&addr) {
-                        results.insert(addr, true);
-                        bar.inc(1);
+                    if let Some(seen) = results.get_mut(&addr) {
+                        if !*seen {
+                            *seen = true;
+                            bar.inc(1);
+                            remaining -= 1;
+                        }
                     }
                 }
             }
@@ -61,7 +64,6 @@ fn blast_and_collect(
         }
     }
 
-    let unreplied = ips.iter().filter(|ip| !results.get(ip).copied().unwrap_or(false)).count();
-    bar.inc(unreplied as u64);
+    bar.inc(remaining as u64);
 }
 
