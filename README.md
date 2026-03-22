@@ -7,7 +7,7 @@ A fast Rust port scanner with raw TCP scan techniques, TLS/HTTP probing, change-
 ## Install
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/meghp89/synapse/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/MeghP89/Synapse/main/install.sh | bash
 ```
 
 Downloads a pre-built binary for your platform (Linux/macOS × x86_64/aarch64). Falls back to building from source (requires Rust) if no binary is available. Service data is installed to `/usr/local/share/synapse/`.

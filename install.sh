@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-REPO="meghp89/synapse"
+REPO="MeghP89/Synapse"
 INSTALL_DIR="/usr/local/bin"
 DATA_DIR="/usr/local/share/synapse"
 
