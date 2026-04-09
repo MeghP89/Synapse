@@ -15,3 +15,4 @@ serde_json = "1"
 rustls = { version = "0.23", features = ["ring", "tls12"] }
 tokio-rustls = { version = "0.26", features = ["tls12"] }
 x509-parser = "0.16"
+rusqlite = { version = "0.32", features = ["bundled"] }

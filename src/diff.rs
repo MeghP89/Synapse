@@ -40,7 +40,11 @@ pub fn now_timestamp() -> u64 {
 
 pub fn save_snapshot(snapshot: &ScanSnapshot) -> std::io::Result<()> {
     fs::create_dir_all("results")?;
-    let path = format!("results/synapse_{}_{}.json", sanitize(&snapshot.target), snapshot.timestamp);
+    let path = format!(
+        "results/synapse_{}_{}.json",
+        sanitize(&snapshot.target),
+        snapshot.timestamp
+    );
     let json = serde_json::to_string_pretty(snapshot)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
     fs::write(path, json)
@@ -48,7 +52,8 @@ pub fn save_snapshot(snapshot: &ScanSnapshot) -> std::io::Result<()> {
 
 pub fn load_latest_snapshot(target: &str) -> Option<ScanSnapshot> {
     let prefix = format!("synapse_{}_", sanitize(target));
-    let mut entries: Vec<_> = fs::read_dir("results").ok()?
+    let mut entries: Vec<_> = fs::read_dir("results")
+        .ok()?
         .filter_map(|e| e.ok())
         .filter(|e| {
             let name = e.file_name();
@@ -62,15 +67,21 @@ pub fn load_latest_snapshot(target: &str) -> Option<ScanSnapshot> {
 }
 
 pub fn compute_diff(old: &ScanSnapshot, new: &ScanSnapshot) -> DiffResult {
-    let old_map: HashMap<&str, &HostSnapshot> = old.hosts.iter().map(|h| (h.ip.as_str(), h)).collect();
-    let new_map: HashMap<&str, &HostSnapshot> = new.hosts.iter().map(|h| (h.ip.as_str(), h)).collect();
+    let old_map: HashMap<&str, &HostSnapshot> =
+        old.hosts.iter().map(|h| (h.ip.as_str(), h)).collect();
+    let new_map: HashMap<&str, &HostSnapshot> =
+        new.hosts.iter().map(|h| (h.ip.as_str(), h)).collect();
 
-    let new_hosts = new.hosts.iter()
+    let new_hosts = new
+        .hosts
+        .iter()
         .filter(|h| !old_map.contains_key(h.ip.as_str()))
         .map(|h| h.ip.clone())
         .collect();
 
-    let lost_hosts = old.hosts.iter()
+    let lost_hosts = old
+        .hosts
+        .iter()
         .filter(|h| !new_map.contains_key(h.ip.as_str()))
         .map(|h| h.ip.clone())
         .collect();
@@ -78,13 +89,23 @@ pub fn compute_diff(old: &ScanSnapshot, new: &ScanSnapshot) -> DiffResult {
     let mut port_changes = Vec::new();
     for new_host in &new.hosts {
         if let Some(old_host) = old_map.get(new_host.ip.as_str()) {
-            let all_ports: HashSet<u16> = old_host.ports.keys()
+            let all_ports: HashSet<u16> = old_host
+                .ports
+                .keys()
                 .chain(new_host.ports.keys())
                 .copied()
                 .collect();
             for port in all_ports {
-                let from = old_host.ports.get(&port).map(String::as_str).unwrap_or("absent");
-                let to   = new_host.ports.get(&port).map(String::as_str).unwrap_or("absent");
+                let from = old_host
+                    .ports
+                    .get(&port)
+                    .map(String::as_str)
+                    .unwrap_or("absent");
+                let to = new_host
+                    .ports
+                    .get(&port)
+                    .map(String::as_str)
+                    .unwrap_or("absent");
                 if from != to {
                     port_changes.push(PortChange {
                         ip: new_host.ip.clone(),
@@ -97,11 +118,21 @@ pub fn compute_diff(old: &ScanSnapshot, new: &ScanSnapshot) -> DiffResult {
         }
     }
 
-    DiffResult { new_hosts, lost_hosts, port_changes }
+    DiffResult {
+        new_hosts,
+        lost_hosts,
+        port_changes,
+    }
 }
 
 fn sanitize(s: &str) -> String {
     s.chars()
-        .map(|c| if c.is_alphanumeric() || c == '.' || c == '-' { c } else { '_' })
+        .map(|c| {
+            if c.is_alphanumeric() || c == '.' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect()
 }

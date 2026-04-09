@@ -64,6 +64,33 @@ else
   sudo chmod +x "$INSTALL_DIR/synapse"
 fi
 
+if [ "$OS" = "linux" ]; then
+  echo "Configuring Linux capability (CAP_NET_RAW) for raw scans..."
+  if command -v setcap >/dev/null 2>&1; then
+    if [ -w "$INSTALL_DIR" ]; then
+      if setcap cap_net_raw+ep "$INSTALL_DIR/synapse" 2>/dev/null; then
+        echo "Applied cap_net_raw to $INSTALL_DIR/synapse"
+      else
+        echo "Could not apply capability without elevated rights; trying sudo..."
+        if sudo setcap cap_net_raw+ep "$INSTALL_DIR/synapse"; then
+          echo "Applied cap_net_raw to $INSTALL_DIR/synapse"
+        else
+          echo "Warning: failed to apply cap_net_raw. Raw scans may still require sudo."
+        fi
+      fi
+    else
+      if sudo setcap cap_net_raw+ep "$INSTALL_DIR/synapse"; then
+        echo "Applied cap_net_raw to $INSTALL_DIR/synapse"
+      else
+        echo "Warning: failed to apply cap_net_raw. Raw scans may still require sudo."
+      fi
+    fi
+  else
+    echo "setcap not found. Install libcap tools and run:"
+    echo "  sudo setcap cap_net_raw+ep $INSTALL_DIR/synapse"
+  fi
+fi
+
 echo "Installing service data to $DATA_DIR..."
 if [ -w "$(dirname "$DATA_DIR")" ]; then
   mkdir -p "$DATA_DIR"
@@ -77,4 +104,4 @@ fi
 
 echo ""
 echo "synapse installed successfully."
-echo "Usage: sudo synapse --help"
+echo "Usage: synapse --help"

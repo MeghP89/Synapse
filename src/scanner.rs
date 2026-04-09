@@ -1,16 +1,16 @@
-use crate::packet::{Channels};
-use std::net::{IpAddr};
+use crate::packet::Channels;
 use std::collections::HashMap;
+use std::net::IpAddr;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::{Instant};
+use std::time::Instant;
 
 use pnet::packet::tcp::TcpFlags;
 use pnet::transport::tcp_packet_iter;
 use pnet::{datalink, packet::tcp::MutableTcpPacket};
-use tokio::sync::Semaphore;
-use tokio::time::{timeout, Duration};
 use tokio::net::{TcpStream, UdpSocket};
+use tokio::sync::Semaphore;
+use tokio::time::{Duration, timeout};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum PortStatus {
@@ -26,7 +26,6 @@ pub struct ScanResult {
     pub ports: HashMap<u16, PortStatus>,
 }
 
-
 struct RttEstimator {
     srtt: f64,
     rttvar: f64,
@@ -35,7 +34,11 @@ struct RttEstimator {
 
 impl RttEstimator {
     fn new() -> Self {
-        Self { srtt: 0.0, rttvar: 0.0, rto: 2000.0 }
+        Self {
+            srtt: 0.0,
+            rttvar: 0.0,
+            rto: 2000.0,
+        }
     }
 
     fn update(&mut self, rtt_ms: f64) {
@@ -131,7 +134,13 @@ fn raw_tcp_scan(
                     let pkt_flags = pkt.get_flags();
                     if let Some(status) = classify_response(pkt_flags, mode) {
                         if matches!(mode, ScanMode::Syn) && status == PortStatus::Open {
-                            let rst = crate::packet::build_tcp_packet(src_ip, dst_ip, rand::random_range(49152..65535u16), probed_port, TcpFlags::RST);
+                            let rst = crate::packet::build_tcp_packet(
+                                src_ip,
+                                dst_ip,
+                                rand::random_range(49152..65535u16),
+                                probed_port,
+                                TcpFlags::RST,
+                            );
                             let _ = tx.send_to(MutableTcpPacket::owned(rst).unwrap(), dst_ip);
                         }
                         port_map.insert(probed_port, status);
@@ -152,7 +161,13 @@ fn raw_tcp_scan(
                         let pkt_flags = pkt.get_flags();
                         if let Some(status) = classify_response(pkt_flags, mode) {
                             if matches!(mode, ScanMode::Syn) && status == PortStatus::Open {
-                                let rst = crate::packet::build_tcp_packet(src_ip, dst_ip, rand::random_range(49152..65535u16), probed_port, TcpFlags::RST);
+                                let rst = crate::packet::build_tcp_packet(
+                                    src_ip,
+                                    dst_ip,
+                                    rand::random_range(49152..65535u16),
+                                    probed_port,
+                                    TcpFlags::RST,
+                                );
                                 let _ = tx.send_to(MutableTcpPacket::owned(rst).unwrap(), dst_ip);
                             }
                             port_map.insert(probed_port, status);
@@ -181,7 +196,13 @@ pub fn fin_scan(
     dst_ports: &[u16],
     channels: &mut Channels,
 ) -> HashMap<u16, PortStatus> {
-    raw_tcp_scan(dst_ip, dst_ports, channels, TcpFlags::FIN, ScanMode::FinNullXmas)
+    raw_tcp_scan(
+        dst_ip,
+        dst_ports,
+        channels,
+        TcpFlags::FIN,
+        ScanMode::FinNullXmas,
+    )
 }
 
 pub fn null_scan(
@@ -276,20 +297,18 @@ pub async fn connect_scan(
         let handle = tokio::spawn(async move {
             let _permit = sem.acquire().await.unwrap();
             let addr = SocketAddr::new(dst_ip, port);
-            let status = match timeout(
-                Duration::from_millis(timeout_ms),
-                TcpStream::connect(addr),
-            ).await {
-                Ok(Ok(_)) => PortStatus::Open,
-                Ok(Err(e)) => {
-                    if e.kind() == std::io::ErrorKind::ConnectionRefused {
-                        PortStatus::Closed
-                    } else {
-                        PortStatus::Filtered
+            let status =
+                match timeout(Duration::from_millis(timeout_ms), TcpStream::connect(addr)).await {
+                    Ok(Ok(_)) => PortStatus::Open,
+                    Ok(Err(e)) => {
+                        if e.kind() == std::io::ErrorKind::ConnectionRefused {
+                            PortStatus::Closed
+                        } else {
+                            PortStatus::Filtered
+                        }
                     }
-                }
-                Err(_) => PortStatus::Filtered,
-            };
+                    Err(_) => PortStatus::Filtered,
+                };
             (port, status)
         });
         handles.push(handle);

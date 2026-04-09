@@ -1,13 +1,11 @@
-use pnet::packet::tcp::{MutableTcpPacket, ipv4_checksum, ipv6_checksum};
-use pnet::packet::icmp::{IcmpPacket, IcmpTypes, checksum};
-use pnet::packet::icmp::echo_request::MutableEchoRequestPacket;
 use pnet::packet::Packet;
-use pnet::transport::{
-    transport_channel, TransportChannelType,
-    TransportSender, TransportReceiver,
-    TransportProtocol,
-};
+use pnet::packet::icmp::echo_request::MutableEchoRequestPacket;
+use pnet::packet::icmp::{IcmpPacket, IcmpTypes, checksum};
 use pnet::packet::ip::IpNextHeaderProtocols;
+use pnet::packet::tcp::{MutableTcpPacket, ipv4_checksum, ipv6_checksum};
+use pnet::transport::{
+    TransportChannelType, TransportProtocol, TransportReceiver, TransportSender, transport_channel,
+};
 use std::net::IpAddr;
 
 pub struct Channels {
@@ -20,23 +18,25 @@ pub fn open_tcp(ips: &[IpAddr]) -> Channels {
     let has_v6 = ips.iter().any(|ip| ip.is_ipv6());
 
     let v4 = if has_v4 {
-        Some(transport_channel(
-            1024,
-            TransportChannelType::Layer4(
-                TransportProtocol::Ipv4(IpNextHeaderProtocols::Tcp)
+        Some(
+            transport_channel(
+                1024,
+                TransportChannelType::Layer4(TransportProtocol::Ipv4(IpNextHeaderProtocols::Tcp)),
             )
-        ).unwrap())
+            .unwrap(),
+        )
     } else {
         None
     };
 
     let v6 = if has_v6 {
-        Some(transport_channel(
-            1024,
-            TransportChannelType::Layer4(
-                TransportProtocol::Ipv6(IpNextHeaderProtocols::Tcp)
+        Some(
+            transport_channel(
+                1024,
+                TransportChannelType::Layer4(TransportProtocol::Ipv6(IpNextHeaderProtocols::Tcp)),
             )
-        ).unwrap())
+            .unwrap(),
+        )
     } else {
         None
     };
@@ -49,23 +49,27 @@ pub fn open_icmp(ips: &[IpAddr]) -> Channels {
     let has_v6 = ips.iter().any(|ip| ip.is_ipv6());
 
     let v4 = if has_v4 {
-        Some(transport_channel(
-            1024,
-            TransportChannelType::Layer4(
-                TransportProtocol::Ipv4(IpNextHeaderProtocols::Icmp)
+        Some(
+            transport_channel(
+                1024,
+                TransportChannelType::Layer4(TransportProtocol::Ipv4(IpNextHeaderProtocols::Icmp)),
             )
-        ).unwrap())
+            .unwrap(),
+        )
     } else {
         None
     };
 
     let v6 = if has_v6 {
-        Some(transport_channel(
-            1024,
-            TransportChannelType::Layer4(
-                TransportProtocol::Ipv6(IpNextHeaderProtocols::Icmpv6)
+        Some(
+            transport_channel(
+                1024,
+                TransportChannelType::Layer4(TransportProtocol::Ipv6(
+                    IpNextHeaderProtocols::Icmpv6,
+                )),
             )
-        ).unwrap())
+            .unwrap(),
+        )
     } else {
         None
     };

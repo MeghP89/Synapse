@@ -1,8 +1,8 @@
-use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr, ToSocketAddrs, UdpSocket};
-use std::fs;
-use std::time::SystemTime;
 use ipnetwork::IpNetwork;
+use std::collections::HashMap;
+use std::fs;
+use std::net::{IpAddr, Ipv4Addr, ToSocketAddrs, UdpSocket};
+use std::time::SystemTime;
 
 pub fn load_services(path: &str) -> HashMap<u16, String> {
     let mut services = HashMap::new();
@@ -29,16 +29,19 @@ pub fn parse_ports(port_str: &str) -> Result<Vec<u16>, String> {
 
     for part in port_str.split(',') {
         if let Some((start_str, end_str)) = part.split_once('-') {
-            let start = start_str.parse::<u16>()
+            let start = start_str
+                .parse::<u16>()
                 .map_err(|_| format!("Invalid start port: {}", start_str))?;
-            let end = end_str.parse::<u16>()
+            let end = end_str
+                .parse::<u16>()
                 .map_err(|_| format!("Invalid end port: {}", end_str))?;
             if start > end {
                 return Err(format!("Start port greater than end port: {}", part));
             }
             ports.extend(start..=end);
         } else {
-            let port = part.parse::<u16>()
+            let port = part
+                .parse::<u16>()
                 .map_err(|_| format!("Invalid single port: {}", part))?;
             ports.push(port);
         }
@@ -49,7 +52,8 @@ pub fn parse_ports(port_str: &str) -> Result<Vec<u16>, String> {
 fn parse_target_addr(ip_raw: &str) -> Result<Vec<IpNetwork>, String> {
     let (host_str, prefix_opt) = match ip_raw.split_once('/') {
         Some((host, prefix_str)) => {
-            let prefix: u8 = prefix_str.parse()
+            let prefix: u8 = prefix_str
+                .parse()
                 .map_err(|_| format!("Invalid CIDR number: {}", prefix_str))?;
             (host, Some(prefix))
         }
@@ -92,11 +96,17 @@ fn parse_target_addr(ip_raw: &str) -> Result<Vec<IpNetwork>, String> {
                 }
                 p
             }
-            None => if ip.is_ipv4() { 32 } else { 128 },
+            None => {
+                if ip.is_ipv4() {
+                    32
+                } else {
+                    128
+                }
+            }
         };
-        let network = IpNetwork::new(ip, prefix)
-            .map_err(|e| format!("Invalid network definition: {}", e))?;
-        
+        let network =
+            IpNetwork::new(ip, prefix).map_err(|e| format!("Invalid network definition: {}", e))?;
+
         if !final_networks.contains(&network) {
             final_networks.push(network);
         }
@@ -110,22 +120,34 @@ fn parse_octet_part(part: &str) -> Result<Vec<u8>, String> {
     }
 
     let mut numbers = Vec::new();
-    
+
     for piece in part.split(',') {
         if let Some((start_str, end_str)) = piece.split_once('-') {
-            let start = if start_str.is_empty() { 0 } else { start_str.parse::<u8>().map_err(|_| "Bad start octet")? };
-            let end = if end_str.is_empty() { 255 } else { end_str.parse::<u8>().map_err(|_| "Bad end octet")? };
-            
-            if start > end { return Err(format!("Invalid range: {}", piece)); }
+            let start = if start_str.is_empty() {
+                0
+            } else {
+                start_str.parse::<u8>().map_err(|_| "Bad start octet")?
+            };
+            let end = if end_str.is_empty() {
+                255
+            } else {
+                end_str.parse::<u8>().map_err(|_| "Bad end octet")?
+            };
+
+            if start > end {
+                return Err(format!("Invalid range: {}", piece));
+            }
             for i in start..=end {
                 numbers.push(i);
             }
         } else {
-            let num = piece.parse::<u8>().map_err(|_| format!("Invalid octet: {}", piece))?;
+            let num = piece
+                .parse::<u8>()
+                .map_err(|_| format!("Invalid octet: {}", piece))?;
             numbers.push(num);
         }
     }
-    
+
     Ok(numbers)
 }
 
@@ -140,7 +162,8 @@ fn parse_octet_range(target: &str) -> Result<Vec<IpAddr>, String> {
     let octet3 = parse_octet_part(parts[2])?;
     let octet4 = parse_octet_part(parts[3])?;
 
-    let mut generated_ips = Vec::with_capacity(octet1.len() * octet2.len() * octet3.len() * octet4.len());
+    let mut generated_ips =
+        Vec::with_capacity(octet1.len() * octet2.len() * octet3.len() * octet4.len());
 
     for &o1 in &octet1 {
         for &o2 in &octet2 {
@@ -156,26 +179,32 @@ fn parse_octet_range(target: &str) -> Result<Vec<IpAddr>, String> {
 }
 
 pub fn apply_exclusions(targets: Vec<IpAddr>, exclusions: &[IpNetwork]) -> Vec<IpAddr> {
-    targets.into_iter()
-        .filter(|ip| !exclusions.iter().any(|excluded_net| excluded_net.contains(*ip)))
+    targets
+        .into_iter()
+        .filter(|ip| {
+            !exclusions
+                .iter()
+                .any(|excluded_net| excluded_net.contains(*ip))
+        })
         .collect()
 }
 
 /// Hardcoded list of sensitive public DNS infrastructure that should never be scanned.
 pub fn sensitive_dns_exclusions() -> Vec<IpNetwork> {
     let addrs: &[&str] = &[
-        "1.1.1.1",           // Cloudflare primary
-        "1.0.0.1",           // Cloudflare secondary
-        "8.8.8.8",           // Google primary
-        "8.8.4.4",           // Google secondary
-        "9.9.9.9",           // Quad9 primary
-        "149.112.112.112",   // Quad9 secondary
-        "208.67.222.222",    // OpenDNS primary
-        "208.67.220.220",    // OpenDNS secondary
-        "64.6.64.6",         // Verisign primary
-        "64.6.65.6",         // Verisign secondary
+        "1.1.1.1",         // Cloudflare primary
+        "1.0.0.1",         // Cloudflare secondary
+        "8.8.8.8",         // Google primary
+        "8.8.4.4",         // Google secondary
+        "9.9.9.9",         // Quad9 primary
+        "149.112.112.112", // Quad9 secondary
+        "208.67.222.222",  // OpenDNS primary
+        "208.67.220.220",  // OpenDNS secondary
+        "64.6.64.6",       // Verisign primary
+        "64.6.65.6",       // Verisign secondary
     ];
-    addrs.iter()
+    addrs
+        .iter()
         .filter_map(|s| s.parse::<IpAddr>().ok())
         .filter_map(|ip| IpNetwork::new(ip, if ip.is_ipv4() { 32 } else { 128 }).ok())
         .collect()
@@ -185,7 +214,13 @@ pub fn save_results(target: &str, content: &str) -> Result<String, std::io::Erro
     fs::create_dir_all("results")?;
     let sanitized = target
         .chars()
-        .map(|c| if c.is_alphanumeric() || c == '.' || c == '-' { c } else { '_' })
+        .map(|c| {
+            if c.is_alphanumeric() || c == '.' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect::<String>();
     let ts = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
@@ -223,14 +258,16 @@ pub async fn dns_resolver(input: &[IpAddr]) -> Vec<String> {
 fn resolver(input: IpAddr) -> Result<String, Box<dyn std::error::Error>> {
     let arpa_domain = match input {
         IpAddr::V4(v4) => {
-            let o =v4.octets();
+            let o = v4.octets();
             format!("{}.{}.{}.{}.in-addr.arpa", o[3], o[2], o[1], o[0])
         }
         IpAddr::V6(v6) => {
             const HEX: &[u8] = b"0123456789abcdef";
             let mut nibbles = String::with_capacity(63);
             for (i, byte) in v6.octets().iter().rev().enumerate() {
-                if i > 0 { nibbles.push('.'); }
+                if i > 0 {
+                    nibbles.push('.');
+                }
                 nibbles.push(HEX[(byte & 0x0F) as usize] as char);
                 nibbles.push('.');
                 nibbles.push(HEX[((byte >> 4) & 0x0F) as usize] as char);
@@ -250,33 +287,33 @@ fn resolver(input: IpAddr) -> Result<String, Box<dyn std::error::Error>> {
 fn build_query(domain: &str, record_type: u16) -> Vec<u8> {
     let mut buf = Vec::with_capacity(domain.len() + 20);
 
-    buf.extend_from_slice(&rand::random::<u16>().to_be_bytes()); 
-    buf.extend_from_slice(&0x0100u16.to_be_bytes()); 
-    buf.extend_from_slice(&1u16.to_be_bytes());      
-    buf.extend_from_slice(&0u16.to_be_bytes());      
-    buf.extend_from_slice(&0u16.to_be_bytes());      
-    buf.extend_from_slice(&0u16.to_be_bytes());      
+    buf.extend_from_slice(&rand::random::<u16>().to_be_bytes());
+    buf.extend_from_slice(&0x0100u16.to_be_bytes());
+    buf.extend_from_slice(&1u16.to_be_bytes());
+    buf.extend_from_slice(&0u16.to_be_bytes());
+    buf.extend_from_slice(&0u16.to_be_bytes());
+    buf.extend_from_slice(&0u16.to_be_bytes());
 
     for label in domain.split('.') {
         buf.push(label.len() as u8);
         buf.extend_from_slice(label.as_bytes());
     }
-    buf.push(0); 
-    buf.extend_from_slice(&record_type  .to_be_bytes()); 
-    buf.extend_from_slice(&1u16.to_be_bytes());        
+    buf.push(0);
+    buf.extend_from_slice(&record_type.to_be_bytes());
+    buf.extend_from_slice(&1u16.to_be_bytes());
 
     buf
 }
 
 fn parse_response(buf: &[u8]) -> Result<String, Box<dyn std::error::Error>> {
     let answer_count = u16::from_be_bytes([buf[6], buf[7]]);
-    
+
     if answer_count == 0 {
         return Err("no PTR record found".into());
     }
 
     let mut pos = 12;
-    
+
     loop {
         let len = buf[pos] as usize;
         if len == 0 {
@@ -289,7 +326,7 @@ fn parse_response(buf: &[u8]) -> Result<String, Box<dyn std::error::Error>> {
         }
         pos += 1 + len;
     }
-    
+
     pos += 4;
 
     if buf[pos] >= 0xC0 {
@@ -297,7 +334,10 @@ fn parse_response(buf: &[u8]) -> Result<String, Box<dyn std::error::Error>> {
     } else {
         loop {
             let len = buf[pos] as usize;
-            if len == 0 { pos += 1; break; }
+            if len == 0 {
+                pos += 1;
+                break;
+            }
             pos += 1 + len;
         }
     }
@@ -314,7 +354,7 @@ fn read_name(buf: &[u8], start: usize) -> Result<String, Box<dyn std::error::Err
 
     loop {
         let len = buf[pos] as usize;
-        
+
         if len == 0 {
             break;
         }

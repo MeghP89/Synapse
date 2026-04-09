@@ -1,19 +1,20 @@
-use pnet::packet::icmp::{IcmpTypes};
+use indicatif::ProgressBar;
+use pnet::packet::icmp::IcmpTypes;
 use pnet::packet::icmp::echo_request::MutableEchoRequestPacket;
 use pnet::packet::tcp::{MutableTcpPacket, TcpFlags};
 use pnet::transport::{TransportReceiver, TransportSender, icmp_packet_iter, tcp_packet_iter};
-use indicatif::ProgressBar;
 
 use crate::packet::Channels;
 
-use std::net::IpAddr;
 use std::collections::HashMap;
+use std::net::IpAddr;
 
 pub fn discover_live_hosts(ips: &[IpAddr], channels: &mut Channels) -> HashMap<IpAddr, bool> {
     let mut results: HashMap<IpAddr, bool> = HashMap::new();
     let bar = ProgressBar::new(ips.len() as u64);
 
-    let (v4_ips, v6_ips): (Vec<IpAddr>, Vec<IpAddr>) = ips.iter().copied().partition(|ip| ip.is_ipv4());
+    let (v4_ips, v6_ips): (Vec<IpAddr>, Vec<IpAddr>) =
+        ips.iter().copied().partition(|ip| ip.is_ipv4());
 
     if !v4_ips.is_empty() {
         if let Some((tx, rx)) = channels.v4.as_mut() {
@@ -39,7 +40,8 @@ fn blast_and_collect(
     bar: &ProgressBar,
 ) {
     for &ip in ips {
-        let packet = MutableEchoRequestPacket::owned(crate::packet::build_icmp_echo_request()).unwrap();
+        let packet =
+            MutableEchoRequestPacket::owned(crate::packet::build_icmp_echo_request()).unwrap();
         let _ = tx.send_to(packet, ip);
         results.insert(ip, false);
     }
@@ -73,7 +75,8 @@ pub fn tcp_syn_discovery(ips: &[IpAddr], channels: &mut Channels) -> HashMap<IpA
 
     let mut results: HashMap<IpAddr, bool> = ips.iter().map(|&ip| (ip, false)).collect();
 
-    let (v4_ips, v6_ips): (Vec<IpAddr>, Vec<IpAddr>) = ips.iter().copied().partition(|ip| ip.is_ipv4());
+    let (v4_ips, v6_ips): (Vec<IpAddr>, Vec<IpAddr>) =
+        ips.iter().copied().partition(|ip| ip.is_ipv4());
 
     if !v4_ips.is_empty() {
         if let Some((tx, rx)) = channels.v4.as_mut() {

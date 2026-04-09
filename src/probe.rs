@@ -1,16 +1,16 @@
-use std::net::{IpAddr, SocketAddr};
 use std::net::IpAddr as StdIpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
-use tokio::time::{timeout, Duration};
-use tokio_rustls::TlsConnector;
 use rustls::ClientConfig;
 use rustls::SignatureScheme;
-use rustls::client::danger::{ServerCertVerified, ServerCertVerifier, HandshakeSignatureValid};
-use rustls::pki_types::{ServerName, CertificateDer, UnixTime};
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::IpAddr as PkiIpAddr;
+use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
+use tokio::time::{Duration, timeout};
+use tokio_rustls::TlsConnector;
 use x509_parser::prelude::*;
 
 pub struct TlsInfo {
@@ -94,7 +94,9 @@ fn make_server_name(ip: StdIpAddr) -> ServerName<'static> {
 
 fn make_connector() -> (TlsConnector, Arc<Mutex<Option<Vec<u8>>>>) {
     let cert_arc: Arc<Mutex<Option<Vec<u8>>>> = Arc::new(Mutex::new(None));
-    let verifier = Arc::new(CaptureVerifier { cert: cert_arc.clone() });
+    let verifier = Arc::new(CaptureVerifier {
+        cert: cert_arc.clone(),
+    });
     let config = ClientConfig::builder()
         .dangerous()
         .with_custom_certificate_verifier(verifier)
@@ -102,8 +104,14 @@ fn make_connector() -> (TlsConnector, Arc<Mutex<Option<Vec<u8>>>>) {
     (TlsConnector::from(Arc::new(config)), cert_arc)
 }
 
-async fn do_http<S: AsyncReadExt + AsyncWriteExt + Unpin>(stream: &mut S, ip: StdIpAddr) -> Option<HttpInfo> {
-    let req = format!("GET / HTTP/1.0\r\nHost: {}\r\nUser-Agent: synapse\r\nConnection: close\r\n\r\n", ip);
+async fn do_http<S: AsyncReadExt + AsyncWriteExt + Unpin>(
+    stream: &mut S,
+    ip: StdIpAddr,
+) -> Option<HttpInfo> {
+    let req = format!(
+        "GET / HTTP/1.0\r\nHost: {}\r\nUser-Agent: synapse\r\nConnection: close\r\n\r\n",
+        ip
+    );
     stream.write_all(req.as_bytes()).await.ok()?;
 
     let mut buf = Vec::with_capacity(8192);
@@ -132,21 +140,28 @@ async fn tls_and_http(ip: StdIpAddr, port: u16) -> Option<ProbeResult> {
         Some(rustls::ProtocolVersion::TLSv1_3) => "TLS 1.3",
         Some(rustls::ProtocolVersion::TLSv1_2) => "TLS 1.2",
         _ => "TLS",
-    }.to_string();
+    }
+    .to_string();
 
     let der = cert_arc.lock().unwrap().clone();
-    let mut tls = der.as_deref().and_then(parse_cert).unwrap_or_else(|| TlsInfo {
-        version: String::new(),
-        cn: None,
-        sans: vec![],
-        issuer: None,
-        expiry: None,
-        expired: false,
-    });
+    let mut tls = der
+        .as_deref()
+        .and_then(parse_cert)
+        .unwrap_or_else(|| TlsInfo {
+            version: String::new(),
+            cn: None,
+            sans: vec![],
+            issuer: None,
+            expiry: None,
+            expired: false,
+        });
     tls.version = version;
 
     let http = do_http(&mut stream, ip).await;
-    Some(ProbeResult { tls: Some(tls), http })
+    Some(ProbeResult {
+        tls: Some(tls),
+        http,
+    })
 }
 
 async fn plain_http(ip: StdIpAddr, port: u16) -> Option<HttpInfo> {
@@ -166,27 +181,34 @@ pub async fn probe_port(ip: IpAddr, port: u16, timeout_ms: u64) -> ProbeResult {
 fn parse_cert(der: &[u8]) -> Option<TlsInfo> {
     let (_, cert) = X509Certificate::from_der(der).ok()?;
 
-    let cn = cert.subject()
+    let cn = cert
+        .subject()
         .iter_common_name()
         .next()
         .and_then(|a| a.as_str().ok())
         .map(String::from);
 
-    let sans: Vec<String> = cert.subject_alternative_name()
+    let sans: Vec<String> = cert
+        .subject_alternative_name()
         .ok()
         .flatten()
-        .map(|ext| ext.value.general_names.iter()
-            .filter_map(|gn| match gn {
-                GeneralName::DNSName(n) => Some(n.to_string()),
-                GeneralName::IPAddress(b) if b.len() == 4 => {
-                    Some(format!("{}.{}.{}.{}", b[0], b[1], b[2], b[3]))
-                }
-                _ => None,
-            })
-            .collect())
+        .map(|ext| {
+            ext.value
+                .general_names
+                .iter()
+                .filter_map(|gn| match gn {
+                    GeneralName::DNSName(n) => Some(n.to_string()),
+                    GeneralName::IPAddress(b) if b.len() == 4 => {
+                        Some(format!("{}.{}.{}.{}", b[0], b[1], b[2], b[3]))
+                    }
+                    _ => None,
+                })
+                .collect()
+        })
         .unwrap_or_default();
 
-    let issuer = cert.issuer()
+    let issuer = cert
+        .issuer()
         .iter_common_name()
         .next()
         .and_then(|a| a.as_str().ok())
@@ -224,14 +246,25 @@ fn ts_to_date(ts: i64) -> String {
 
 fn parse_http(data: &[u8]) -> Option<HttpInfo> {
     let text = std::str::from_utf8(data).unwrap_or("");
-    let status: u16 = text.lines().next()?.split_whitespace().nth(1)?.parse().ok()?;
+    let status: u16 = text
+        .lines()
+        .next()?
+        .split_whitespace()
+        .nth(1)?
+        .parse()
+        .ok()?;
 
-    let server = text.lines()
+    let server = text
+        .lines()
         .find(|l| l.to_ascii_lowercase().starts_with("server:"))
         .map(|l| l[7..].trim().to_string());
 
     let title = extract_title(text);
-    Some(HttpInfo { status, server, title })
+    Some(HttpInfo {
+        status,
+        server,
+        title,
+    })
 }
 
 fn extract_title(html: &str) -> Option<String> {

@@ -35,8 +35,14 @@ Downloads a pre-built binary for your platform (Linux/macOS × x86_64/aarch64). 
 
 ## Requirements
 
-- **Root / CAP_NET_RAW** required for raw socket scan types (SYN, FIN, NULL, XMAS, ACK) and ICMP discovery
+- **Linux:** raw socket scan types (SYN, FIN, NULL, XMAS, ACK) and ICMP discovery require `CAP_NET_RAW` (or root)
 - `connect`, `udp`, `--probe`, and `--diff` work without root
+
+On Linux, installer attempts to set capability automatically. Manual command:
+
+```bash
+sudo setcap cap_net_raw+ep /usr/local/bin/synapse
+```
 
 ---
 
@@ -51,7 +57,7 @@ cargo build --release
 ## Usage
 
 ```
-sudo synapse [OPTIONS] --target <TARGET>
+synapse [OPTIONS] --target <TARGET>
 ```
 
 ### Options
@@ -84,10 +90,10 @@ sudo synapse [OPTIONS] --target <TARGET>
 
 ```bash
 # Connect scan on default ports
-sudo synapse -t 192.168.1.1
+synapse -t 192.168.1.1
 
 # SYN scan a /24 on ports 22, 80, 443
-sudo synapse -t 10.0.0.0/24 -p 22,80,443 -s syn
+synapse -t 10.0.0.0/24 -p 22,80,443 -s syn
 
 # Connect scan with TLS + HTTP probing
 synapse -t 192.168.1.1 -p 80,443,8080,8443 --probe
@@ -96,16 +102,16 @@ synapse -t 192.168.1.1 -p 80,443,8080,8443 --probe
 synapse -t 192.168.1.1 --diff
 
 # FIN scan for stateless firewall evasion
-sudo synapse -t 10.0.0.1 -p 1-1024 -s fin
+synapse -t 10.0.0.1 -p 1-1024 -s fin
 
 # ACK scan to map firewall rules
-sudo synapse -t 10.0.0.1 -p 22,80,443 -s ack
+synapse -t 10.0.0.1 -p 22,80,443 -s ack
 
 # UDP scan common ports
 synapse -t 10.0.0.1 -p 53,67,123,161,500 -s udp
 
 # Octet range scan, save output
-sudo synapse -t 192.168.1.1-50 -p 1-1024 -o
+synapse -t 192.168.1.1-50 -p 1-1024 -o
 ```
 
 ---
